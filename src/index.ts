@@ -1,10 +1,21 @@
 import { stderr, stdout } from "node:process";
 import { $ as build$ } from "execa";
+import fg from "fast-glob";
 import { createLogUpdate } from "log-update";
 import stripAnsi from "strip-ansi";
 import * as ansiColors from "yoctocolors";
 
-type Executor = typeof build$;
+type SimpleItem = string | number;
+
+type GlobTemplate = SimpleItem | SimpleItem[] | { glob: string | string[] };
+type Executor = typeof build$ & {
+  (
+    ...templateString: readonly [
+      TemplateStringsArray,
+      ...(readonly GlobTemplate[])
+    ]
+  ): ReturnType<typeof build$>;
+};
 
 export type Worker<T = any> = {
   readonly data: T;
@@ -75,6 +86,8 @@ const colorLess = Object.fromEntries(
 
 const allowsInput = typeof process.stdin.setRawMode === "function";
 const color = allowsInput ? ansiColors : colorLess;
+
+const exec$ = withGlob(build$);
 
 export function schedule<
   Source = string,
@@ -268,7 +281,7 @@ class TaskReporter {
     };
     const stepStart = Date.now();
     const executor = (...args: Parameters<Executor>) => {
-      const x = build$(...args);
+      const x = exec$(...args);
       if (Symbol.asyncIterator in x) {
         this.logger?.log("COMMAND", `${x.spawnargs.join(" ")}`, wid);
         const commandAnnotation =
@@ -327,7 +340,7 @@ class TaskReporter {
           const duration = formatDuration(Date.now() - this.runtime.start);
           switch (group.runtime.status) {
             case "active":
-              this.logger?.log("COMPLETED", `Completed in ${duration}`);
+              this.logger?.log("DONE", `Done in ${duration}`);
               this.resolve();
               break;
             case "failed":
@@ -375,7 +388,7 @@ class TaskReporter {
 
 type LoggerAction =
   | ("STARTING" | "FINISHED" | "FAILED")
-  | ("SKIPPING" | "COMPLETED" | "COMMAND" | "OUTPUT");
+  | ("SKIPPING" | "DONE" | "COMMAND" | "OUTPUT");
 class Logger {
   stream = process.stdout;
   tagColors: Partial<Record<LoggerAction, typeof color.dim>> = {
@@ -391,7 +404,7 @@ class Logger {
   symbols: Partial<Record<LoggerAction, string>> = {
     COMMAND: "$",
     OUTPUT: "\u203A",
-    COMPLETED: "",
+    DONE: "",
   };
   log(action: LoggerAction, message: string, stepMarker = "") {
     const ts = getFormattedTimestamp();
@@ -400,7 +413,7 @@ class Logger {
     const symbol = this.symbols[action] ?? "~";
     const prefix = `${color.dim(`[${ts}]`)}${stepMarker}${symbol}`;
     const annotation =
-      action === "OUTPUT" || action === "COMMAND" || action === "COMPLETED"
+      action === "OUTPUT" || action === "COMMAND" || action === "DONE"
         ? ""
         : paint(`[${action}] `);
     this.stream.write(`${prefix} ${annotation}${print(message)}\n`);
@@ -471,6 +484,40 @@ function startPuffer(getState: () => string) {
   stdout.write = puffer.write;
   stderr.write = puffer.write;
   return puffer;
+}
+
+function withGlob(original: typeof build$, cwd?: string): Executor {
+  return Object.assign((...args: Parameters<Executor>) => {
+    if (Array.isArray(args[0]) && "raw" in args[0]) {
+      args.forEach((x, index) => {
+        if (typeof x === "object" && x != null && "glob" in x) {
+          const wildcard = x.glob;
+          if (
+            typeof wildcard === "string" ||
+            (Array.isArray(wildcard) &&
+              wildcard.every((it: unknown) => typeof it === "string"))
+          ) {
+            const matches = fg.sync(wildcard, { cwd });
+            if (matches.length === 0) {
+              const at = cwd ? ` in directory ${cwd}` : "";
+              throw new Error(`No matches for wildcard '${wildcard}'${at}`);
+            }
+            args[index] = matches as any;
+          }
+        }
+      });
+      return original.apply(null, args as never);
+    } else {
+      const output = original.apply(null, args as never);
+      if (typeof output === "function") {
+        return withGlob(output, (args[0] as any)?.cwd ?? cwd);
+      }
+    }
+  }, original);
+}
+
+export function glob(strings, ...values) {
+  return { glob: String.raw({ raw: strings }, ...values) };
 }
 
 function verifyExecutionPathExists(

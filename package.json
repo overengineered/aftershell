@@ -1,6 +1,6 @@
 {
   "name": "aftershell",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Advanced shell scripting tools",
   "type": "module",
   "exports": "./dist/index.js",
@@ -23,6 +23,7 @@
   "homepage": "https://github.com/overengineered/aftershell#readme",
   "dependencies": {
     "execa": "^9.1.0",
+    "fast-glob": "^3.3.2",
     "log-update": "^6.0.0",
     "yoctocolors": "^2.0.2"
   },

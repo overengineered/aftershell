@@ -9,6 +9,7 @@
     "declaration": true,
     "outDir": "./dist",
     "skipLibCheck": true,
+    "incremental": true,
     "inlineSources": true,
     "sourceMap": true,
     "allowSyntheticDefaultImports": true
