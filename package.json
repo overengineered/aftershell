@@ -1,0 +1,33 @@
+{
+  "name": "aftershell",
+  "version": "0.2.0",
+  "description": "Advanced shell scripting tools",
+  "type": "module",
+  "exports": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "rm -rf dist && tsc -p tsconfig.emit.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/overengineered/aftershell.git"
+  },
+  "files": [
+    "dist"
+  ],
+  "author": "Juozas Kontvainis",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/overengineered/aftershell/issues"
+  },
+  "homepage": "https://github.com/overengineered/aftershell#readme",
+  "dependencies": {
+    "execa": "^9.1.0",
+    "log-update": "^6.0.0",
+    "yoctocolors": "^2.0.2"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.6",
+    "typescript": "^5.4.4"
+  }
+}
