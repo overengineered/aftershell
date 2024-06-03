@@ -4,6 +4,7 @@
     "noEmit": false,
     "declaration": true,
     "declarationMap": true,
+    "tsBuildInfoFile": "tsconfig.emit.tsbuildinfo",
     "outDir": "./dist/"
   },
   "exclude": ["__tests__"]

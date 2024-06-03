@@ -235,6 +235,21 @@ type TaskTracker = {
   annotation?: string;
 };
 
+const ID_ALT = ((all: string) => [
+  ...all.split(""),
+  ...all.toUpperCase().split(""),
+])("abcdefghijklmnopqrstuvwxyz");
+
+export function generateIdLabel(value: number): string {
+  if (value < 100) {
+    return String(value).padStart(2, "0");
+  } else {
+    const last = (value - 100) % ID_ALT.length;
+    const first = (value - 100 - last) / ID_ALT.length;
+    return first < ID_ALT.length ? ID_ALT[first] + ID_ALT[last] : "??";
+  }
+}
+
 class TaskReporter {
   runtime: Runtime;
   running: TaskTracker[] = [];
@@ -261,8 +276,7 @@ class TaskReporter {
   }
 
   issueId() {
-    const id = this.nextId < 100 ? String(this.nextId).padStart(2, "0") : "??";
-    const result = `@${id}`;
+    const result = `@${generateIdLabel(this.nextId)}`;
     this.nextId += 1;
     return result;
   }

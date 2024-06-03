@@ -10,6 +10,7 @@
     "outDir": "./dist",
     "skipLibCheck": true,
     "incremental": true,
+    "tsBuildInfoFile": "tsconfig.tsbuildinfo",
     "inlineSources": true,
     "sourceMap": true,
     "allowSyntheticDefaultImports": true
