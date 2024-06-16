@@ -70,8 +70,9 @@ type Step = {
 
 type Runtime = {
   start: number;
-  status: "active" | "failed";
-  error?: unknown;
+  isInteractive: boolean;
+  status: "active" | "failed" | "cancelled";
+  exitCause?: { error?: unknown; interrupt?: string };
 };
 
 type Group = {
@@ -95,26 +96,26 @@ export function schedule<
 >(define: Configurator<Term>): Driver<Term> {
   return {
     run: async (options = {}) => {
-      let verbose = !!options.verbose;
-      if (options.verbose === undefined) {
-        if (allowsInput) {
-          const cursor = await readCursorPosition(100);
-          if (!cursor) {
-            verbose = true;
-          } else {
-            verbose = false;
-            if (cursor.x > 1) {
-              process.stderr.write("\n");
-            }
+      let isInteractive = allowsInput;
+      if (allowsInput) {
+        const cursor = await readCursorPosition(100);
+        if (cursor) {
+          isInteractive = true;
+          if (cursor.x > 1) {
+            process.stderr.write("\n");
           }
-        } else {
-          verbose = process.argv.includes("--verbose");
         }
       }
+
+      const verbose =
+        options.verbose != null
+          ? !!options.verbose
+          : process.argv.includes("--verbose") || !isInteractive;
 
       const runtime: Runtime = {
         start: Date.now(),
         status: "active",
+        isInteractive,
       };
 
       // allows defining tasks container after schedule function
@@ -220,9 +221,26 @@ export function schedule<
         },
       };
 
+      const cancelTasks = () => {
+        if (runtime.status === "active") {
+          runtime.status = "cancelled";
+          runtime.exitCause = { interrupt: "SIGINT" };
+        } else if (
+          runtime.status === "failed" ||
+          runtime.status === "cancelled"
+        ) {
+          process.exit(1);
+        }
+      };
+      process.on("SIGINT", cancelTasks);
+
       ready.forEach((step) => reporter.start(group, step));
 
-      await reporter.result();
+      try {
+        await reporter.result();
+      } finally {
+        process.off("SIGINT", cancelTasks);
+      }
     },
   };
 }
@@ -240,7 +258,7 @@ const ID_ALT = ((all: string) => [
   ...all.toUpperCase().split(""),
 ])("abcdefghijklmnopqrstuvwxyz");
 
-export function generateIdLabel(value: number): string {
+function generateIdLabel(value: number): string {
   if (value < 100) {
     return String(value).padStart(2, "0");
   } else {
@@ -284,6 +302,7 @@ class TaskReporter {
   symbols = {
     done: color.green("\u2714"),
     fail: color.red("\u2716"),
+    stop: color.red("\u25FC"),
   };
 
   start(group: Group, step: Step) {
@@ -306,13 +325,14 @@ class TaskReporter {
             for await (const line of x) {
               this.logger?.log("OUTPUT", String(line), wid);
             }
-          })();
+          })().catch(() => "ignore");
         }
-        x.finally(() => {
+        const clearAnnotation = () => {
           if (tracker.annotation === commandAnnotation) {
             tracker.annotation = undefined;
           }
-        });
+        };
+        x.then(clearAnnotation).catch(clearAnnotation);
       }
       return x;
     };
@@ -321,7 +341,7 @@ class TaskReporter {
       displayTitle: (title: string) =>
         void (tracker.title = color.bold(stripAnsi(title))),
       displayTitleTag: (tag: string) =>
-        void (tracker.titleTag = color.bold(stripAnsi(tag))),
+        void (tracker.titleTag = stripAnsi(tag)),
       displayAnnotation: (text: string | undefined) =>
         void (tracker.annotation = text ? stripAnsi(text) : text),
       $: executor as unknown as Executor,
@@ -338,11 +358,24 @@ class TaskReporter {
           group.activate(step.output, result);
         }
       })
-      .catch((e) => {
-        this.puffer?.emit(`${this.symbols.fail} ${color.red(step.title)}\n`);
-        this.logger?.log("FAILED", color.red(step.title) + "\n" + e, wid);
-        this.runtime.error = e;
-        this.runtime.status = "failed";
+      .catch((error) => {
+        const wasCancelled =
+          this.runtime.exitCause?.interrupt &&
+          error?.signal === this.runtime.exitCause.interrupt;
+        if (wasCancelled) {
+          this.puffer?.emit(`${this.symbols.stop} ${step.title}\n`);
+          if (this.logger && this.runtime.isInteractive) {
+            process.stdout.write("\n");
+          }
+          this.logger?.log("CANCELLED", step.title, wid);
+        } else {
+          this.puffer?.emit(`${this.symbols.fail} ${color.red(step.title)}\n`);
+          this.logger?.log("FAILED", color.red(step.title) + "\n" + error, wid);
+        }
+        if (!this.runtime.exitCause) {
+          this.runtime.exitCause = { error };
+          this.runtime.status = "failed";
+        }
       })
       .finally(() => {
         const pos = this.running.indexOf(tracker);
@@ -358,7 +391,15 @@ class TaskReporter {
               this.resolve();
               break;
             case "failed":
-              this.reject(group.runtime.error);
+              const failure = group.runtime.exitCause;
+              const error = "error" in failure ? failure.error : undefined;
+              this.reject(error);
+              break;
+            case "cancelled":
+              const info = group.runtime.exitCause.interrupt
+                ? ` by ${group.runtime.exitCause.interrupt}`
+                : "";
+              this.logger?.log("CANCELLED", `Cancelled${info}`, wid);
               break;
           }
         }
@@ -374,11 +415,11 @@ class TaskReporter {
   renderTaskList = () => {
     const l = this.frames.length;
     const x = (this.active = this.active + 1);
-    const dot = color.cyanBright;
+    const dot = this.runtime.status === "active" ? color.cyanBright : color.red;
     let info = this.running
       .map((tracker, i) => {
         const frame = dot(this.frames[(x + ((l - i) % l)) % l]);
-        const tag = tracker.titleTag ? ` ${tracker.titleTag}` : "";
+        const tag = tracker.titleTag ? " " + tracker.titleTag : "";
         let line = `${frame} ${tracker.title}${tag}\n`;
         if (tracker.annotation) {
           const short = tracker.annotation.slice(0, (stdout.columns ?? 80) - 5);
@@ -388,9 +429,20 @@ class TaskReporter {
       })
       .join("");
 
-    if (this.runtime.error) {
+    if (
+      this.runtime.status === "failed" ||
+      this.runtime.status === "cancelled"
+    ) {
       if (this.running.length > 0) {
-        info += `\nFailed, ${this.running.length} tasks still running`;
+        const status =
+          this.runtime.status === "cancelled" ? "Cancelled" : "Failed";
+        const leftovers =
+          this.running.length === 1 ? "1 task" : this.running.length + " tasks";
+        info += `\n${status}, finishing ${leftovers} (Press Ctrl+C to exit)`;
+      } else {
+        if (!this.logger && this.runtime.exitCause.interrupt) {
+          info += `\nCancelled by ${this.runtime.exitCause.interrupt}`;
+        }
       }
     } else {
       info += //
@@ -401,7 +453,7 @@ class TaskReporter {
 }
 
 type LoggerAction =
-  | ("STARTING" | "FINISHED" | "FAILED")
+  | ("STARTING" | "FINISHED" | "FAILED" | "CANCELLED")
   | ("SKIPPING" | "DONE" | "COMMAND" | "OUTPUT");
 class Logger {
   stream = process.stdout;
@@ -410,6 +462,7 @@ class Logger {
     FINISHED: color.green,
     SKIPPING: color.gray,
     FAILED: color.red,
+    CANCELLED: color.red,
   };
   messageColors: Partial<Record<LoggerAction, typeof color.dim>> = {
     STARTING: color.gray,
@@ -425,7 +478,8 @@ class Logger {
     const paint = this.tagColors[action] ?? identity;
     const print = this.messageColors[action] ?? identity;
     const symbol = this.symbols[action] ?? "~";
-    const prefix = `${color.dim(`[${ts}]`)}${stepMarker}${symbol}`;
+    const id = stepMarker || symbol ? ` ${stepMarker}${symbol}` : "";
+    const prefix = `${color.dim(`[${ts}]`)}${id}`;
     const annotation =
       action === "OUTPUT" || action === "COMMAND" || action === "DONE"
         ? ""
