@@ -273,6 +273,9 @@ export function schedule<
         if (runtime.status === "active") {
           runtime.status = "cancelled";
           runtime.exitCause = { interrupt: "SIGINT" };
+          if (runtime.isInteractive && reporter.logger) {
+            reporter.logger.shouldAddNewLine = true;
+          }
         } else if (
           runtime.status === "failed" ||
           runtime.status === "cancelled"
@@ -373,7 +376,8 @@ class TaskReporter {
             for await (const line of x) {
               this.logger?.log("OUTPUT", String(line), wid);
             }
-          })().catch(() => "ignore");
+            this.logger?.end(wid);
+          })().catch(() => this.logger?.end(wid));
         }
         const clearAnnotation = () => {
           if (tracker.annotation === commandAnnotation) {
@@ -412,9 +416,6 @@ class TaskReporter {
           error?.signal === this.runtime.exitCause.interrupt;
         if (wasCancelled) {
           this.puffer?.emit(`${this.symbols.stop} ${step.title}\n`);
-          if (this.logger && this.runtime.isInteractive) {
-            process.stdout.write("\n");
-          }
           this.logger?.log("CANCELLED", step.title, wid);
         } else {
           this.puffer?.emit(`${this.symbols.fail} ${color.red(step.title)}\n`);
@@ -448,7 +449,7 @@ class TaskReporter {
               const info = group.runtime.exitCause?.interrupt
                 ? ` by ${group.runtime.exitCause?.interrupt}`
                 : "";
-              this.logger?.log("CANCELLED", `Cancelled${info}`, wid);
+              this.logger?.log("DONE", color.red(`Cancelled${info}`));
               break;
           }
         }
@@ -513,6 +514,22 @@ class Logger {
     FAILED: color.red,
     CANCELLED: color.red,
   };
+  shouldAddNewLine = false;
+  gutterColors = [
+    color.bgYellowBright,
+    color.bgGreenBright,
+    color.bgWhiteBright,
+    color.bgCyan,
+    color.bgMagenta,
+    color.bgGray,
+    color.bgBlue,
+    color.bgGreen,
+    color.bgRed,
+  ];
+  mainColorCount = 4;
+  nextColor = 0;
+  gutterUsage = new Map<string, number>();
+  gutterCounters = this.gutterColors.map(() => 0);
   messageColors: Partial<Record<LoggerAction, typeof color.dim>> = {
     STARTING: color.gray,
     SKIPPING: color.dim,
@@ -527,13 +544,42 @@ class Logger {
     const paint = this.tagColors[action] ?? identity;
     const print = this.messageColors[action] ?? identity;
     const symbol = this.symbols[action] ?? "~";
-    const id = stepMarker || symbol ? ` ${stepMarker}${symbol}` : "";
-    const prefix = `${color.dim(`[${ts}]`)}${id}`;
+    const gutter =
+      action === "OUTPUT" ? this.getColor(stepMarker)(symbol) : symbol;
+    const id = stepMarker || symbol ? ` ${stepMarker}${gutter}` : "";
+    const correction = this.shouldAddNewLine ? "\n" : "";
+    this.shouldAddNewLine = false;
+    const prefix = `${correction}${color.dim(`[${ts}]`)}${id}`;
     const annotation =
       action === "OUTPUT" || action === "COMMAND" || action === "DONE"
         ? ""
         : paint(`[${action}] `);
     this.stream.write(`${prefix} ${annotation}${print(message)}\n`);
+  }
+  end(stepMarker: string) {
+    this.gutterUsage.delete(stepMarker);
+  }
+  getColor(id: string): typeof color.red {
+    const preselected = this.gutterUsage.get(id);
+    if (preselected !== undefined) {
+      return this.gutterColors[preselected];
+    }
+    if (this.gutterCounters[this.nextColor] === 0) {
+      this.gutterCounters[this.nextColor] += 1;
+      const result = this.gutterColors[this.nextColor];
+      this.gutterUsage.set(id, this.nextColor);
+      this.nextColor = (this.nextColor + 1) % this.mainColorCount;
+      return result;
+    } else {
+      const index = indexOfMin(this.gutterCounters);
+      this.gutterCounters[index] += 1;
+      this.gutterUsage.set(id, index);
+      this.nextColor =
+        index < this.mainColorCount
+          ? (index + 1) % this.mainColorCount
+          : this.nextColor;
+      return this.gutterColors[index];
+    }
   }
 }
 
@@ -705,6 +751,18 @@ function formatDuration(millis: number) {
     seconds = "00";
   }
   return `${minutes.toFixed(0)}m${seconds.padStart(2, "0")}s`;
+}
+
+function indexOfMin(data: number[]): number {
+  let min = data[0];
+  let minIndex = 0;
+  for (let i = 1; i < data.length; i++) {
+    if (min === undefined || data[i] < min) {
+      min = data[i];
+      minIndex = i;
+    }
+  }
+  return minIndex;
 }
 
 function parsePosition(encoded: string) {
