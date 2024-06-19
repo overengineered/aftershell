@@ -28,11 +28,13 @@ export type Worker<T = any> = {
 export type Task<T = any> = (this: Worker<T>, $: Executor) => Promise<unknown>;
 export type Tasks<T = any> = Record<string, Task<T>>;
 
+type TaskOptions<Term extends string> = {
+  verbose?: boolean;
+  data?: Partial<Record<Term, unknown>>;
+};
+
 export type Driver<Term extends string> = {
-  run: (options?: {
-    verbose?: boolean;
-    data?: Partial<Record<Term, unknown>>;
-  }) => Promise<void>;
+  run: (options?: TaskOptions<Term>) => Promise<void>;
 };
 
 type Configurator<Term extends string> = (
@@ -42,15 +44,19 @@ type Configurator<Term extends string> = (
 
 type Matcher<Term extends string> = ((
   condition: Pattern<Term> | Pattern<Term>[] | null
-) => Actions) &
+) => Actions & Restrictions<Term>) &
   ((
     condition: Pattern<Term> | Pattern<Term>[] | null,
     output: Output<Term>
-  ) => Actions);
+  ) => Actions & Restrictions<Term>);
 
 type Actions = {
-  call: ((task: (executor: Executor) => Promise<unknown>) => void) &
+  readonly call: ((task: (executor: Executor) => Promise<unknown>) => void) &
     ((label: string, task: (executor: Executor) => Promise<unknown>) => void);
+};
+
+type Restrictions<Term extends string> = {
+  readonly only: (options?: TaskOptions<Term>) => Actions;
 };
 
 type Pattern<Term extends string> = Term | `?${Term}` | `!${Term}`;
@@ -66,6 +72,7 @@ type Step = {
   input: string[];
   output?: Output<string>;
   task: (executor: Executor) => unknown;
+  data?: Record<string, unknown>;
 };
 
 type Runtime = {
@@ -107,11 +114,6 @@ export function schedule<
         }
       }
 
-      const verbose =
-        options.verbose != null
-          ? !!options.verbose
-          : process.argv.includes("--verbose") || !isInteractive;
-
       const runtime: Runtime = {
         start: Date.now(),
         status: "active",
@@ -122,56 +124,95 @@ export function schedule<
       await Promise.resolve();
 
       const steps: Step[] = [];
+      let execution: "full" | "focused" = "full";
+      let verboseOverride: boolean | undefined = undefined;
       const when: Matcher<Term> = (
         condition: Pattern<Term> | Pattern<Term>[] | null,
         output?: Output<Term>
-      ) => ({
-        call: (
-          nameSource: ((executor: Executor) => unknown) | string,
-          fn?: (executor: Executor) => unknown
-        ) => {
-          const stepId = steps.length;
-          const task =
-            typeof nameSource === "function"
-              ? nameSource
-              : (nonNull(nameSource, "First argument is required, found %s"),
-                nonNull(fn, "Second argument function is required, found %s"));
-          const title = color.bold(
-            task !== nameSource
-              ? String(nameSource)
-              : getTitle(task, "#" + (steps.length + 1))
-          );
-          const input: string[] = [];
-          const requirements: { term: string; expect: boolean }[] = [];
-          asList(condition).forEach((pattern) => {
-            if (pattern.startsWith("!") || pattern.startsWith("?")) {
-              const term = pattern.slice(1);
-              input.push(validateTerm(term));
-              requirements.push({ term, expect: pattern.startsWith("?") });
-            } else {
-              input.push(validateTerm(pattern));
-            }
-          });
-          validateTerm(output?.make);
-          const isQualified = (
-            state: Record<string, unknown>,
-            allowUndefined?: boolean
-          ) =>
-            requirements.every(
-              (condition) =>
-                (allowUndefined && state[condition.term] === undefined) ||
-                !!state[condition.term] === condition.expect
+      ) => {
+        let focusedOptions: TaskOptions<Term> | undefined = undefined;
+        const actions = {
+          call: (
+            nameSource: ((executor: Executor) => unknown) | string,
+            fn?: (executor: Executor) => unknown
+          ) => {
+            const stepId = steps.length;
+            const task =
+              typeof nameSource === "function"
+                ? nameSource
+                : (nonNull(nameSource, "First argument is required, found %s"),
+                  nonNull(
+                    fn,
+                    "Second argument function is required, found %s"
+                  ));
+            const title = color.bold(
+              task !== nameSource
+                ? String(nameSource)
+                : getTitle(task, "#" + (steps.length + 1))
             );
-          steps.push({
-            stepId,
-            title,
-            isQualified,
-            input,
-            output,
-            task,
-          });
-        },
-      });
+            const input: string[] = [];
+            const requirements: { term: string; expect: boolean }[] = [];
+            if (!focusedOptions) {
+              asList(condition).forEach((pattern) => {
+                if (pattern.startsWith("!") || pattern.startsWith("?")) {
+                  const term = pattern.slice(1);
+                  input.push(validateTerm(term));
+                  requirements.push({ term, expect: pattern.startsWith("?") });
+                } else {
+                  input.push(validateTerm(pattern));
+                }
+              });
+            } else if (execution === "focused") {
+              input.push(String(steps.length));
+            }
+            validateTerm(output?.make);
+            const isQualified = (
+              state: Record<string, unknown>,
+              allowUndefined?: boolean
+            ) =>
+              (focusedOptions ? [] : requirements).every(
+                (condition) =>
+                  (allowUndefined && state[condition.term] === undefined) ||
+                  !!state[condition.term] === condition.expect
+              );
+            if (focusedOptions) {
+              if (execution === "full") {
+                steps.length = 0;
+              }
+              execution = "focused";
+            }
+            if (verboseOverride === undefined && focusedOptions) {
+              if (typeof focusedOptions.verbose === "boolean") {
+                verboseOverride = focusedOptions.verbose;
+              }
+            }
+            if (
+              execution === "full" ||
+              (execution === "focused" && focusedOptions)
+            ) {
+              steps.push({
+                stepId,
+                title,
+                isQualified,
+                input: input,
+                output: focusedOptions
+                  ? { make: String(steps.length + 1) }
+                  : output,
+                task,
+                data: focusedOptions?.data,
+              });
+            }
+          },
+        };
+
+        return {
+          ...actions,
+          only: (options?: TaskOptions<Term>) => {
+            focusedOptions = options ?? {};
+            return actions;
+          },
+        };
+      };
 
       const make = (make: Term) => ({ make });
       define(when, make);
@@ -187,15 +228,11 @@ export function schedule<
         verifyExecutionPathExists(runnable, key, [], done, isReady);
       }
 
-      const logger = new Logger();
-
-      if (options.verbose && runnable.length < steps.length) {
-        for (const skipped of steps) {
-          if (!runnable.includes(skipped)) {
-            logger.log("SKIPPING", skipped.title, color.gray("@00"));
-          }
-        }
-      }
+      const verbose =
+        verboseOverride ??
+        (options.verbose != null
+          ? !!options.verbose
+          : process.argv.includes("--verbose") || !isInteractive);
 
       const remaining = new Set(runnable);
 
@@ -203,6 +240,14 @@ export function schedule<
       ready.forEach((step) => remaining.delete(step));
 
       const reporter = new TaskReporter(runtime, verbose);
+
+      if (verbose && runnable.length < steps.length) {
+        for (const skipped of steps) {
+          if (!runnable.includes(skipped)) {
+            reporter.logger?.log("SKIPPING", skipped.title, color.gray("@00"));
+          }
+        }
+      }
 
       const group: Group = {
         data: { ...config },
@@ -215,6 +260,9 @@ export function schedule<
             if (step.input.every((key) => done.has(key))) {
               remaining.delete(step);
               ready.push(step);
+              if (step.data) {
+                Object.assign(group.data, step.data);
+              }
             }
           }
           ready.forEach((step) => reporter.start(this, step));
@@ -392,12 +440,13 @@ class TaskReporter {
               break;
             case "failed":
               const failure = group.runtime.exitCause;
-              const error = "error" in failure ? failure.error : undefined;
+              const error =
+                failure && "error" in failure ? failure.error : undefined;
               this.reject(error);
               break;
             case "cancelled":
-              const info = group.runtime.exitCause.interrupt
-                ? ` by ${group.runtime.exitCause.interrupt}`
+              const info = group.runtime.exitCause?.interrupt
+                ? ` by ${group.runtime.exitCause?.interrupt}`
                 : "";
               this.logger?.log("CANCELLED", `Cancelled${info}`, wid);
               break;
@@ -440,8 +489,8 @@ class TaskReporter {
           this.running.length === 1 ? "1 task" : this.running.length + " tasks";
         info += `\n${status}, finishing ${leftovers} (Press Ctrl+C to exit)`;
       } else {
-        if (!this.logger && this.runtime.exitCause.interrupt) {
-          info += `\nCancelled by ${this.runtime.exitCause.interrupt}`;
+        if (!this.logger && this.runtime.exitCause?.interrupt) {
+          info += `\nCancelled by ${this.runtime.exitCause?.interrupt}`;
         }
       }
     } else {
@@ -574,9 +623,9 @@ function withGlob(original: typeof build$, cwd?: string): Executor {
           }
         }
       });
-      return original.apply(null, args as never);
+      return (original as Function).apply(null, args);
     } else {
-      const output = original.apply(null, args as never);
+      const output = (original as Function).apply(null, args);
       if (typeof output === "function") {
         return withGlob(output, (args[0] as any)?.cwd ?? cwd);
       }
@@ -584,8 +633,8 @@ function withGlob(original: typeof build$, cwd?: string): Executor {
   }, original);
 }
 
-export function glob(strings, ...values) {
-  return { glob: String.raw({ raw: strings }, ...values) };
+export function glob(strings: TemplateStringsArray, ...values: unknown[]) {
+  return { glob: String.raw(strings, ...values) };
 }
 
 function verifyExecutionPathExists(
@@ -657,6 +706,7 @@ function formatDuration(millis: number) {
   }
   return `${minutes.toFixed(0)}m${seconds.padStart(2, "0")}s`;
 }
+
 function parsePosition(encoded: string) {
   for (let c = 0, x = "", y = "", o = ""; c < encoded.length; c++) {
     const char = encoded[c];

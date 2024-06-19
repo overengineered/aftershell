@@ -1,8 +1,7 @@
 {
   "compilerOptions": {
     "noEmit": true,
-    "jsx": "react",
-    "jsxFactory": "h",
+    "strict": true,
     "target": "ESNext",
     "module": "ESNext",
     "moduleResolution": "node",
