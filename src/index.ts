@@ -223,6 +223,9 @@ export function schedule<
       const done = new Set(
         [...inputs].filter((key) => config && config[key as Term] !== undefined)
       );
+      !done.has("start") && done.add("start");
+      !done.has("0") && done.add("0");
+
       const isReady = (step: Step) => step.input.every((key) => done.has(key));
       for (const key of inputs) {
         verifyExecutionPathExists(runnable, key, [], done, isReady);
