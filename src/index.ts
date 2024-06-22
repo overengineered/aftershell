@@ -7,14 +7,14 @@ import * as ansiColors from "yoctocolors";
 
 type SimpleItem = string | number;
 
-type GlobTemplate = SimpleItem | SimpleItem[] | { glob: string | string[] };
-type Executor = typeof build$ & {
-  (
-    ...templateString: readonly [
-      TemplateStringsArray,
-      ...(readonly GlobTemplate[])
-    ]
-  ): ReturnType<typeof build$>;
+type GlobItem = SimpleItem | SimpleItem[] | { glob: string | string[] };
+type ExecWithGlob<T = ReturnType<typeof build$>> = (
+  ...templateString: readonly [TemplateStringsArray, ...(readonly GlobItem[])]
+) => T;
+type GlobExecutor = typeof build$ & ExecWithGlob;
+type Executor = GlobExecutor & {
+  read: ExecWithGlob<Promise<string>> &
+    ((stream: "stdout" | "stderr") => ExecWithGlob<Promise<string>>);
 };
 
 export type Worker<T = any> = {
@@ -365,29 +365,58 @@ class TaskReporter {
     };
     const stepStart = Date.now();
     const executor = (...args: Parameters<Executor>) => {
-      const x = exec$(...args);
-      if (Symbol.asyncIterator in x) {
+      const printer = this.logger;
+      const print = function* (line: string) {
+        printer?.log("OUTPUT", String(line), wid);
+        yield line;
+      };
+      let run = exec$;
+      const first = args[0];
+      if (
+        typeof first === "object" &&
+        !Array.isArray(first) &&
+        !("raw" in first)
+      ) {
+        if (!("stdout" in first)) {
+          (first as any).stdout = print as never;
+        }
+        if (!("stderr" in first)) {
+          (first as any).stderr = print as never;
+        }
+      } else {
+        run = exec$({ stdout: print, stderr: print } as any) as never;
+      }
+      const x = run(...args);
+      if ("spawnargs" in x) {
         this.logger?.log("COMMAND", `${x.spawnargs.join(" ")}`, wid);
         const commandAnnotation =
           color.bold(color.cyanBright("$ ")) + x.spawnargs.join(" ");
         tracker.annotation = commandAnnotation;
-        if (this.logger) {
-          (async () => {
-            for await (const line of x) {
-              this.logger?.log("OUTPUT", String(line), wid);
-            }
-            this.logger?.end(wid);
-          })().catch(() => this.logger?.end(wid));
-        }
-        const clearAnnotation = () => {
+        const deactivate = () => {
+          this.logger?.end(wid);
           if (tracker.annotation === commandAnnotation) {
             tracker.annotation = undefined;
           }
         };
-        x.then(clearAnnotation).catch(clearAnnotation);
+        x.then(deactivate).catch(deactivate);
       }
       return x;
     };
+
+    const read: Executor["read"] = (first, ...rest) => {
+      if (first === "stdout" || first === "stderr") {
+        const reader: ExecWithGlob<Promise<string>> = async (...args) => {
+          const result = await exec$(...args);
+          return String(first === "stdout" ? result.stdout : result.stderr);
+        };
+        return reader as any;
+      } else {
+        const run = exec$({ all: true });
+        return run(first, ...(rest as never[])).then((r) => r.all);
+      }
+    };
+    Object.assign(executor, { read });
+
     const worker: Worker = {
       data: group.data,
       displayTitle: (title: string) =>
@@ -649,7 +678,7 @@ function startPuffer(getState: () => string) {
   return puffer;
 }
 
-function withGlob(original: typeof build$, cwd?: string): Executor {
+function withGlob(original: typeof build$, cwd?: string): GlobExecutor {
   return Object.assign((...args: Parameters<Executor>) => {
     if (Array.isArray(args[0]) && "raw" in args[0]) {
       args.forEach((x, index) => {
