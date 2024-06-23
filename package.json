@@ -22,7 +22,7 @@
   },
   "homepage": "https://github.com/overengineered/aftershell#readme",
   "dependencies": {
-    "execa": "^9.1.0",
+    "execa": "^9.3.0",
     "fast-glob": "^3.3.2",
     "log-update": "^6.0.0",
     "yoctocolors": "^2.0.2"
