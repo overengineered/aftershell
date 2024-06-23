@@ -21,7 +21,7 @@ export type Worker<T = any> = {
   readonly data: T;
   readonly displayTitle: (text: string) => void;
   readonly displayTitleTag: (tag: string) => void;
-  readonly displayAnnotation: (text: string | undefined) => void;
+  readonly addActivity: (activity: string) => UpdateActivity;
   readonly $: Executor;
 };
 
@@ -36,6 +36,8 @@ type TaskOptions<Token extends string> = {
 export type Driver<Token extends string> = {
   run: (options?: TaskOptions<Token>) => Promise<void>;
 };
+
+export type UpdateActivity = (result?: unknown) => void;
 
 type Configurator<Token extends string> = (
   when: Matcher<Token>,
@@ -306,7 +308,12 @@ type TaskTracker = {
   titleTag?: string;
   step: Step;
   marker: string;
-  annotation?: string;
+  activities: Activity[];
+};
+
+type Activity = {
+  title: string;
+  status: "active" | "command" | "done" | "fail";
 };
 
 const ID_ALT = ((all: string) => [
@@ -367,6 +374,7 @@ class TaskReporter {
       step,
       title: step.title,
       marker: wid,
+      activities: [],
     };
     const stepStart = Date.now();
     const executor = (...args: Parameters<Executor>) => {
@@ -394,14 +402,12 @@ class TaskReporter {
       const x = run(...args);
       if ("spawnargs" in x) {
         this.logger?.log("COMMAND", `${x.spawnargs.join(" ")}`, wid);
-        const commandAnnotation =
-          color.bold(color.cyanBright("$ ")) + x.spawnargs.join(" ");
-        tracker.annotation = commandAnnotation;
+        const title = x.spawnargs.join(" ");
+        const activity: Activity = { title, status: "command" };
+        tracker.activities.push(activity);
         const deactivate = () => {
           this.logger?.end(wid);
-          if (tracker.annotation === commandAnnotation) {
-            tracker.annotation = undefined;
-          }
+          activity.status = "done";
         };
         x.then(deactivate).catch(deactivate);
       }
@@ -428,8 +434,22 @@ class TaskReporter {
         void (tracker.title = color.bold(stripAnsi(title))),
       displayTitleTag: (tag: string) =>
         void (tracker.titleTag = stripAnsi(tag)),
-      displayAnnotation: (text: string | undefined) =>
-        void (tracker.annotation = text ? stripAnsi(text) : text),
+      addActivity: (title: string) => {
+        const activity: Activity = {
+          title: stripAnsi(title),
+          status: "active",
+        };
+        this.logger?.log("INIT", activity.title, wid);
+        tracker.activities.push(activity);
+        return (result) => {
+          activity.status = result instanceof Error ? "fail" : "done";
+          this.logger?.log(
+            activity.status === "done" ? "DONE" : "FAIL",
+            activity.title,
+            wid
+          );
+        };
+      },
       $: executor as unknown as Executor,
     };
     this.running.push(tracker);
@@ -470,7 +490,7 @@ class TaskReporter {
           const duration = formatDuration(Date.now() - this.runtime.start);
           switch (group.runtime.status) {
             case "active":
-              this.logger?.log("DONE", `Done in ${duration}`);
+              this.logger?.log("COMPLETED", `Done in ${duration}`);
               this.resolve();
               break;
             case "failed":
@@ -483,7 +503,7 @@ class TaskReporter {
               const info = group.runtime.exitCause?.interrupt
                 ? ` by ${group.runtime.exitCause?.interrupt}`
                 : "";
-              this.logger?.log("DONE", color.red(`Cancelled${info}`));
+              this.logger?.log("COMPLETED", color.red(`Cancelled${info}`));
               break;
           }
         }
@@ -505,10 +525,19 @@ class TaskReporter {
         const frame = dot(this.frames[(x + ((l - i) % l)) % l]);
         const tag = tracker.titleTag ? " " + tracker.titleTag : "";
         let line = `${frame} ${tracker.title}${tag}\n`;
-        if (tracker.annotation) {
-          const short = tracker.annotation.slice(0, (stdout.columns ?? 80) - 5);
-          line += `  ${short}\n`;
-        }
+        tracker.activities.forEach((activity, index, all) => {
+          const connector = color.gray(index === all.length - 1 ? "└╸" : "├╸");
+          const status =
+            activity.status === "done"
+              ? this.symbols.done
+              : activity.status === "fail"
+              ? this.symbols.fail
+              : activity.status === "command"
+              ? color.bold(color.cyanBright("$"))
+              : color.bold(color.cyanBright("▸"));
+          const short = activity.title.slice(0, (stdout.columns ?? 80) - 8);
+          line += `  ${color.dim(connector)}${status} ${short}\n`;
+        });
         return line;
       })
       .join("");
@@ -538,7 +567,8 @@ class TaskReporter {
 
 type LoggerAction =
   | ("STARTING" | "FINISHED" | "FAILED" | "CANCELLED")
-  | ("SKIPPING" | "DONE" | "COMMAND" | "OUTPUT");
+  | ("INIT" | "DONE" | "FAIL")
+  | ("SKIPPING" | "COMPLETED" | "COMMAND" | "OUTPUT");
 class Logger {
   stream = process.stdout;
   tagColors: Partial<Record<LoggerAction, typeof color.dim>> = {
@@ -547,6 +577,9 @@ class Logger {
     SKIPPING: color.gray,
     FAILED: color.red,
     CANCELLED: color.red,
+    INIT: color.gray,
+    DONE: color.gray,
+    FAIL: color.gray,
   };
   shouldAddNewLine = false;
   gutterColors = [
@@ -571,7 +604,10 @@ class Logger {
   symbols: Partial<Record<LoggerAction, string>> = {
     COMMAND: "$",
     OUTPUT: "\u203A",
-    DONE: "",
+    COMPLETED: "",
+    INIT: "→",
+    DONE: "→",
+    FAIL: "→",
   };
   log(action: LoggerAction, message: string, stepMarker = "") {
     const ts = getFormattedTimestamp();
@@ -585,7 +621,7 @@ class Logger {
     this.shouldAddNewLine = false;
     const prefix = `${correction}${color.dim(`[${ts}]`)}${id}`;
     const annotation =
-      action === "OUTPUT" || action === "COMMAND" || action === "DONE"
+      action === "OUTPUT" || action === "COMMAND" || action === "COMPLETED"
         ? ""
         : paint(`[${action}] `);
     this.stream.write(`${prefix} ${annotation}${print(message)}\n`);
