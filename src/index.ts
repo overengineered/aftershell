@@ -99,7 +99,9 @@ const exec$ = withGlob(build$);
 
 export function schedule<
   Source = string,
-  Term extends string = Source extends string ? Source : keyof Source & string
+  Term extends string = Source extends string
+    ? "start" | "0" | Source
+    : "start" | "0" | (keyof Source & string)
 >(define: Configurator<Term>): Driver<Term> {
   return {
     run: async (options = {}) => {
