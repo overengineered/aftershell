@@ -28,39 +28,39 @@ export type Worker<T = any> = {
 export type Task<T = any> = (this: Worker<T>, $: Executor) => Promise<unknown>;
 export type Tasks<T = any> = Record<string, Task<T>>;
 
-type TaskOptions<Term extends string> = {
+type TaskOptions<Token extends string> = {
   verbose?: boolean;
-  data?: Partial<Record<Term, unknown>>;
+  data?: Partial<Record<Token, unknown>>;
 };
 
-export type Driver<Term extends string> = {
-  run: (options?: TaskOptions<Term>) => Promise<void>;
+export type Driver<Token extends string> = {
+  run: (options?: TaskOptions<Token>) => Promise<void>;
 };
 
-type Configurator<Term extends string> = (
-  when: Matcher<Term>,
-  make: (key: Term) => Output<Term>
+type Configurator<Token extends string> = (
+  when: Matcher<Token>,
+  make: (key: Token) => Output<Token>
 ) => void;
 
-type Matcher<Term extends string> = ((
-  condition: Pattern<Term> | Pattern<Term>[] | null
-) => Actions & Restrictions<Term>) &
+type Matcher<Token extends string> = ((
+  condition: Pattern<Token> | Pattern<Token>[] | null
+) => Actions & Restrictions<Token>) &
   ((
-    condition: Pattern<Term> | Pattern<Term>[] | null,
-    output: Output<Term>
-  ) => Actions & Restrictions<Term>);
+    condition: Pattern<Token> | Pattern<Token>[] | null,
+    output: Output<Token>
+  ) => Actions & Restrictions<Token>);
 
 type Actions = {
   readonly call: ((task: (executor: Executor) => Promise<unknown>) => void) &
     ((label: string, task: (executor: Executor) => Promise<unknown>) => void);
 };
 
-type Restrictions<Term extends string> = {
-  readonly only: (options?: TaskOptions<Term>) => Actions;
+type Restrictions<Token extends string> = {
+  readonly only: (options?: TaskOptions<Token>) => Actions;
 };
 
-type Pattern<Term extends string> = Term | `?${Term}` | `!${Term}`;
-type Output<Term> = { make: Term };
+type Pattern<Token extends string> = Token | `?${Token}` | `!${Token}`;
+type Output<Token> = { make: Token };
 
 type Step = {
   stepId: number;
@@ -99,10 +99,10 @@ const exec$ = withGlob(build$);
 
 export function schedule<
   Source = string,
-  Term extends string = Source extends string
+  Token extends string = Source extends string
     ? "start" | "0" | Source
     : "start" | "0" | (keyof Source & string)
->(define: Configurator<Term>): Driver<Term> {
+>(define: Configurator<Token>): Driver<Token> {
   return {
     run: async (options = {}) => {
       let isInteractive = allowsInput;
@@ -128,11 +128,11 @@ export function schedule<
       const steps: Step[] = [];
       let execution: "full" | "focused" = "full";
       let verboseOverride: boolean | undefined = undefined;
-      const when: Matcher<Term> = (
-        condition: Pattern<Term> | Pattern<Term>[] | null,
-        output?: Output<Term>
+      const when: Matcher<Token> = (
+        condition: Pattern<Token> | Pattern<Token>[] | null,
+        output?: Output<Token>
       ) => {
-        let focusedOptions: TaskOptions<Term> | undefined = undefined;
+        let focusedOptions: TaskOptions<Token> | undefined = undefined;
         const actions = {
           call: (
             nameSource: ((executor: Executor) => unknown) | string,
@@ -153,29 +153,29 @@ export function schedule<
                 : getTitle(task, "#" + (steps.length + 1))
             );
             const input: string[] = [];
-            const requirements: { term: string; expect: boolean }[] = [];
+            const requirements: { token: string; expect: boolean }[] = [];
             if (!focusedOptions) {
               asList(condition).forEach((pattern) => {
                 if (pattern.startsWith("!") || pattern.startsWith("?")) {
-                  const term = pattern.slice(1);
-                  input.push(validateTerm(term));
-                  requirements.push({ term, expect: pattern.startsWith("?") });
+                  const token = pattern.slice(1);
+                  input.push(validateToken(token));
+                  requirements.push({ token, expect: pattern.startsWith("?") });
                 } else {
-                  input.push(validateTerm(pattern));
+                  input.push(validateToken(pattern));
                 }
               });
             } else if (execution === "focused") {
               input.push(String(steps.length));
             }
-            validateTerm(output?.make);
+            validateToken(output?.make);
             const isQualified = (
               state: Record<string, unknown>,
               allowUndefined?: boolean
             ) =>
               (focusedOptions ? [] : requirements).every(
                 (condition) =>
-                  (allowUndefined && state[condition.term] === undefined) ||
-                  !!state[condition.term] === condition.expect
+                  (allowUndefined && state[condition.token] === undefined) ||
+                  !!state[condition.token] === condition.expect
               );
             if (focusedOptions) {
               if (execution === "full") {
@@ -209,21 +209,21 @@ export function schedule<
 
         return {
           ...actions,
-          only: (options?: TaskOptions<Term>) => {
+          only: (options?: TaskOptions<Token>) => {
             focusedOptions = options ?? {};
             return actions;
           },
         };
       };
 
-      const make = (make: Term) => ({ make });
+      const make = (make: Token) => ({ make });
       define(when, make);
 
-      const config = options.data ?? ({} as Record<Term, unknown>);
+      const config = options.data ?? ({} as Record<string, unknown>);
       const runnable = steps.filter((it) => it.isQualified(config, true));
       const inputs = new Set(runnable.flatMap((step) => step.input));
       const done = new Set(
-        [...inputs].filter((key) => config && config[key as Term] !== undefined)
+        [...inputs].filter((key) => config && config[key] !== undefined)
       );
       !done.has("start") && done.add("start");
       !done.has("0") && done.add("0");
@@ -852,7 +852,7 @@ function readCursorPosition(timeout = 80) {
 }
 
 const ReservedSymbol = /(\?|\!|\*|\#|\^|\:\(\))/;
-function validateTerm<T>(value: T): T {
+function validateToken<T>(value: T): T {
   if (typeof value === "string") {
     const res = ReservedSymbol.exec(value);
     if (res) {
