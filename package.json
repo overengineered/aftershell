@@ -6,7 +6,7 @@
   "exports": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "scripts": {
-    "build": "rm -rf dist tsconfig.emit.tsbuildinfo && tsc -p tsconfig.emit.json"
+    "build": "tsc -p tsconfig.emit.json"
   },
   "repository": {
     "type": "git",
@@ -29,6 +29,6 @@
   },
   "devDependencies": {
     "@types/node": "^20.12.6",
-    "typescript": "^5.4.4"
+    "typescript": "^5.5.0"
   }
 }

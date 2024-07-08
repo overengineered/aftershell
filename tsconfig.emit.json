@@ -4,7 +4,7 @@
     "noEmit": false,
     "declaration": true,
     "declarationMap": true,
-    "tsBuildInfoFile": "tsconfig.emit.tsbuildinfo",
+    "tsBuildInfoFile": null,
     "outDir": "./dist/"
   }
 }

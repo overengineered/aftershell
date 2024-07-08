@@ -1,4 +1,5 @@
 import { stderr, stdout } from "node:process";
+import fs from "node:fs/promises";
 import { $ as build$ } from "execa";
 import fg from "fast-glob";
 import { createLogUpdate } from "log-update";
@@ -33,6 +34,10 @@ type TaskOptions<Token extends string> = {
   data?: Partial<Record<Token, unknown>>;
 };
 
+type RunOptions<Token extends string> = TaskOptions<Token> & {
+  skip?: "never" | "allow";
+};
+
 export type Driver<Token extends string> = {
   run: (options?: TaskOptions<Token>) => Promise<void>;
 };
@@ -45,21 +50,41 @@ type Configurator<Token extends string> = (
 ) => void;
 
 type Matcher<Token extends string> = ((
-  condition: Pattern<Token> | Pattern<Token>[] | null
-) => Actions & Restrictions<Token>) &
+  trigger: Pattern<Token> | Pattern<Token>[] | null
+) => Actions & Conditions<Token> & Restrictions<Token>) &
   ((
-    condition: Pattern<Token> | Pattern<Token>[] | null,
+    trigger: Pattern<Token> | Pattern<Token>[] | null,
     output: Output<Token>
-  ) => Actions & Restrictions<Token>);
+  ) => Actions & Conditions<Token> & Restrictions<Token>);
 
-type Actions = {
-  readonly call: ((task: (executor: Executor) => Promise<unknown>) => void) &
-    ((label: string, task: (executor: Executor) => Promise<unknown>) => void);
+type Actions<R = void> = {
+  readonly call: ((task: (executor: Executor) => Promise<unknown>) => R) &
+    ((label: string, task: (executor: Executor) => Promise<unknown>) => R);
 };
 
 type Restrictions<Token extends string> = {
-  readonly only: (options?: TaskOptions<Token>) => Actions;
+  readonly only: (options?: RunOptions<Token>) => Actions & Conditions<Token>;
 };
+
+type Conditions<Token extends string> = {
+  readonly if: (clause: Clause<Token>) => Actions<Recovery>;
+};
+
+type Recovery = {
+  readonly else: (value: unknown) => void;
+};
+
+type ClauseResult = Promise<{ shouldRun: boolean; note?: string }>;
+type EvalClause<Token extends string = string> = (
+  data?: Partial<Record<Token, unknown>>
+) => ClauseResult;
+
+type Clause<Token extends string> =
+  | { expired: string | string[]; ttl: Millis }
+  | { missing: string | string[] }
+  | EvalClause<Token>;
+
+type Millis = number | `${number}s` | `${number}m` | `${number}h`;
 
 type Pattern<Token extends string> = Token | `?${Token}` | `!${Token}`;
 type Output<Token> = { make: Token };
@@ -74,6 +99,10 @@ type Step = {
   input: string[];
   output?: Output<string>;
   task: (executor: Executor) => unknown;
+  allowSkipping: boolean;
+  evalClause?: EvalClause;
+  fileClause?: FileClause;
+  getResult?: () => unknown;
   data?: Record<string, unknown>;
 };
 
@@ -124,17 +153,20 @@ export function schedule<
         isInteractive,
       };
 
-      // allows defining tasks container after schedule function
+      // allows defining tasks after schedule function
       await Promise.resolve();
 
       const steps: Step[] = [];
       let execution: "full" | "focused" = "full";
       let verboseOverride: boolean | undefined = undefined;
       const when: Matcher<Token> = (
-        condition: Pattern<Token> | Pattern<Token>[] | null,
+        trigger: Pattern<Token> | Pattern<Token>[] | null,
         output?: Output<Token>
       ) => {
-        let focusedOptions: TaskOptions<Token> | undefined = undefined;
+        let focusedOptions: RunOptions<Token> | undefined = undefined;
+        let taskClause: Clause<string> | undefined = undefined;
+        let taskResult: unknown = undefined;
+        const getResult = () => taskResult;
         const actions = {
           call: (
             nameSource: ((executor: Executor) => unknown) | string,
@@ -157,7 +189,7 @@ export function schedule<
             const input: string[] = [];
             const requirements: { token: string; expect: boolean }[] = [];
             if (!focusedOptions) {
-              asList(condition).forEach((pattern) => {
+              asList(trigger).forEach((pattern) => {
                 if (pattern.startsWith("!") || pattern.startsWith("?")) {
                   const token = pattern.slice(1);
                   input.push(validateToken(token));
@@ -203,17 +235,39 @@ export function schedule<
                   ? { make: String(steps.length + 1) }
                   : output,
                 task,
+                allowSkipping:
+                  !focusedOptions ||
+                  (focusedOptions.skip ?? "never") !== "never",
+                evalClause: readEvalClause(taskClause),
+                fileClause: readFileClause(taskClause),
+                getResult,
                 data: focusedOptions?.data,
               });
             }
           },
         };
 
-        return {
+        const skippable = {
           ...actions,
+          if: (clause: Clause<string>) => {
+            taskClause = clause;
+            const recovery: Recovery = {
+              else: (value) => (taskResult = value),
+            };
+            return {
+              call: (arg0, arg1?: Parameters<typeof actions.call>[1]) => {
+                actions.call(arg0, arg1);
+                return recovery;
+              },
+            } satisfies Actions<Recovery>;
+          },
+        };
+
+        return {
+          ...skippable,
           only: (options?: TaskOptions<Token>) => {
             focusedOptions = options ?? {};
-            return actions;
+            return skippable;
           },
         };
       };
@@ -227,8 +281,7 @@ export function schedule<
       const done = new Set(
         [...inputs].filter((key) => config && config[key] !== undefined)
       );
-      !done.has("start") && done.add("start");
-      !done.has("0") && done.add("0");
+      done.add("start").add("0");
 
       const isReady = (step: Step) => step.input.every((key) => done.has(key));
       for (const key of inputs) {
@@ -247,14 +300,51 @@ export function schedule<
       ready.forEach((step) => remaining.delete(step));
 
       const reporter = new TaskReporter(runtime, verbose);
+      const history = new History(".aftershell", reporter.logger);
 
       if (verbose && runnable.length < steps.length) {
         for (const skipped of steps) {
           if (!runnable.includes(skipped)) {
-            reporter.logger?.log("SKIPPING", skipped.title, color.gray("@00"));
+            const info = color.dim(skipped.title);
+            reporter.logger?.log("SKIPPING", info, color.gray("@00"));
           }
         }
       }
+
+      const activateStep = (group: Group) => async (step: Step) => {
+        let shouldRun = false;
+        let note: string | undefined = undefined;
+        if (step.evalClause || step.fileClause) {
+          const result: unknown =
+            (await step.evalClause?.(step.data)) ??
+            (await checkFiles(step.fileClause, history));
+          if (!result || typeof result !== "object") {
+            const actual = result == null ? result : typeof result;
+            note = `(got ${actual}, expected object)`;
+          } else if (!("shouldRun" in result)) {
+            note = `(missing shouldRun value)`;
+          } else {
+            shouldRun = Boolean(result.shouldRun);
+            note = "note" in result ? String(result.note) : "";
+          }
+          if (!shouldRun && step.allowSkipping) {
+            const info =
+              color.dim(step.title) + (note ? " " + color.magenta(note) : "");
+            reporter.logger?.log("SKIPPING", info, color.gray("@00"));
+            reporter.puffer?.emit(`${reporter.symbols.skip} ${info}\n`);
+            if (step.output) {
+              group.activate(step.output, step.getResult?.());
+            }
+            return;
+          }
+        } else {
+          shouldRun = true;
+        }
+        if (!shouldRun) {
+          note = "(skip disabled)";
+        }
+        reporter.start(group, step, note);
+      };
 
       const group: Group = {
         data: { ...config },
@@ -272,7 +362,7 @@ export function schedule<
               }
             }
           }
-          ready.forEach((step) => reporter.start(this, step));
+          ready.forEach(activateStep(this));
         },
       };
 
@@ -292,12 +382,15 @@ export function schedule<
       };
       process.on("SIGINT", cancelTasks);
 
-      ready.forEach((step) => reporter.start(group, step));
+      ready.forEach(activateStep(group));
 
+      let success = false;
       try {
         await reporter.result();
+        success = true;
       } finally {
         process.off("SIGINT", cancelTasks);
+        await history.close({ merge: !success || execution !== "full" });
       }
     },
   };
@@ -363,12 +456,13 @@ class TaskReporter {
   }
 
   symbols = {
-    done: color.green("\u2714"),
-    fail: color.red("\u2716"),
-    stop: color.red("\u25FC"),
+    done: color.green("✔"),
+    fail: color.red("✖"),
+    stop: color.red("◼"),
+    skip: color.yellow("∅"),
   };
 
-  start(group: Group, step: Step) {
+  start(group: Group, step: Step, note?: string) {
     const wid = color.cyan(this.issueId());
     const tracker: TaskTracker = {
       step,
@@ -453,7 +547,8 @@ class TaskReporter {
       $: executor as unknown as Executor,
     };
     this.running.push(tracker);
-    this.logger?.log("STARTING", step.title, wid);
+    const start = note ? `${step.title} ${color.magenta(note)}` : step.title;
+    this.logger?.log("STARTING", start, wid);
     Promise.resolve(step.task.call(worker, executor as unknown as Executor))
       .then((result) => {
         const styled = this.logger ? color.green : color.dim;
@@ -568,7 +663,7 @@ class TaskReporter {
 type LoggerAction =
   | ("STARTING" | "FINISHED" | "FAILED" | "CANCELLED")
   | ("INIT" | "DONE" | "FAIL")
-  | ("SKIPPING" | "COMPLETED" | "COMMAND" | "OUTPUT");
+  | ("SKIPPING" | "COMPLETED" | "ALERT" | "COMMAND" | "OUTPUT");
 class Logger {
   stream = process.stdout;
   tagColors: Partial<Record<LoggerAction, typeof color.dim>> = {
@@ -580,6 +675,7 @@ class Logger {
     INIT: color.gray,
     DONE: color.gray,
     FAIL: color.gray,
+    ALERT: color.red,
   };
   shouldAddNewLine = false;
   gutterColors = [
@@ -599,11 +695,10 @@ class Logger {
   gutterCounters = this.gutterColors.map(() => 0);
   messageColors: Partial<Record<LoggerAction, typeof color.dim>> = {
     STARTING: color.gray,
-    SKIPPING: color.dim,
   };
   symbols: Partial<Record<LoggerAction, string>> = {
     COMMAND: "$",
-    OUTPUT: "\u203A",
+    OUTPUT: "›",
     COMPLETED: "",
     INIT: "→",
     DONE: "→",
@@ -753,6 +848,201 @@ export function glob(strings: TemplateStringsArray, ...values: unknown[]) {
   return { glob: String.raw(strings, ...values) };
 }
 
+export class History {
+  loaded: null | Promise<Record<string, string[]>> = null;
+  updated: Record<string, string[] | undefined> = {};
+
+  constructor(public path: string, public logger?: Logger) {}
+
+  load(key: string): Promise<string[] | undefined> {
+    return (
+      this.loaded ||
+      (this.loaded = fs
+        .readFile(this.path, "utf8")
+        .then((text) => JSON.parse(text))
+        .catch((e) => {
+          if (!String(e).includes("ENOENT")) {
+            const alert = `Failed to read file ${this.path}: ${e}`;
+            this.logger?.log("ALERT", alert);
+          }
+          return {};
+        }))
+    ).then((data) => (data?.[key] ? toStringArray(data[key]) : undefined));
+  }
+
+  save(key: string, value: string[] | undefined) {
+    this.updated[key] = value;
+  }
+
+  async close({ merge }: { merge: boolean }) {
+    if (this.loaded) {
+      try {
+        const data = merge ? { ...this.loaded, ...this.updated } : this.updated;
+        await fs.writeFile(this.path, JSON.stringify(data), "utf8");
+      } catch (e) {
+        const alert = `Failed to write file ${this.path}: ${e}`;
+        this.logger?.log("ALERT", alert);
+      }
+    }
+  }
+}
+
+type FileClause =
+  | {
+      type: "expired";
+      patterns: string[];
+      ttl: number;
+    }
+  | {
+      type: "missing";
+      patterns: string[];
+      key: string;
+    };
+
+function readEvalClause(clause?: Clause<string>): EvalClause | undefined {
+  return typeof clause === "function" ? clause : undefined;
+}
+
+function readFileClause(clause?: Clause<string>): FileClause | undefined {
+  if (!clause || typeof clause === "function") {
+    return undefined;
+  }
+  if ("expired" in clause) {
+    const patterns = toStringArray(clause.expired);
+    return { type: "expired", patterns, ttl: parseMillis(clause.ttl) };
+  }
+  if ("missing" in clause) {
+    const patterns = toStringArray(clause.missing);
+    return {
+      type: "missing",
+      patterns,
+      key: JSON.stringify({ missing: patterns }),
+    };
+  }
+  const residue: never = clause;
+  return void residue;
+}
+
+function toStringArray(value: unknown): string[] {
+  if (Array.isArray(value)) {
+    return value.map((item) => String(item)).sort();
+  }
+  return [String(value)];
+}
+
+type Recording = {
+  load: (key: string) => Promise<string[] | undefined>;
+  save: (key: string, value: string[] | undefined) => void;
+};
+
+async function checkFiles(
+  clause: FileClause | undefined,
+  recording: Recording
+): ClauseResult {
+  if (!clause) {
+    return { shouldRun: true };
+  }
+
+  if (clause.type === "expired") {
+    const found = (await fg.async(clause.patterns)).sort();
+
+    if (found.length === 0) {
+      return {
+        shouldRun: true,
+        note: `(Nothing found for ${clause.patterns.join(";")})`,
+      };
+    }
+
+    let oldest = found[0];
+    let oldestAge: null | number = null;
+    for (let i = 0, l = found.length; i < l; i++) {
+      const file = found[i];
+      const { mtime } = await fs.stat(file);
+      const age = Date.now() - mtime.getTime();
+      if (oldestAge === null || age > oldestAge) {
+        oldest = file;
+        oldestAge = age;
+      }
+    }
+
+    const diff = (oldestAge ?? 0) - clause.ttl;
+    if (diff >= 0) {
+      return {
+        shouldRun: true,
+        note: `(${oldest} is expired for ${formatDuration(diff)})`,
+      };
+    }
+
+    return {
+      shouldRun: false,
+      note: `(${oldest} will expire in ${formatDuration(-diff)})`,
+    };
+  }
+
+  if (clause.type === "missing") {
+    const groups = await Promise.all(clause.patterns.map((it) => fg.async(it)));
+    const found = groups.map((group) => group.sort()).flat();
+
+    for (let i = 0, l = groups.length; i < l; i++) {
+      if (groups[i].length === 0) {
+        recording.save(clause.key, undefined);
+        return {
+          shouldRun: true,
+          note: `(Nothing found for ${clause.patterns[i]})`,
+        };
+      }
+    }
+
+    const previouslyFound = await recording.load(clause.key);
+    recording.save(clause.key, found);
+
+    if (previouslyFound) {
+      const content = compareContents(previouslyFound, found);
+      if (content.missing.length > 0) {
+        const more =
+          content.missing.length === 1
+            ? ""
+            : ` +${content.missing.length - 1} more`;
+        return {
+          shouldRun: true,
+          note: `(Missing ${content.missing[0]}${more})`,
+        };
+      }
+    }
+
+    const note = `(Found ${found[0]}${
+      found.length === 1 ? "" : ` +${found.length - 1} more`
+    })`;
+
+    return { shouldRun: false, note };
+  }
+
+  return { shouldRun: true, note: "(invalid config)" };
+}
+
+function compareContents(
+  a1: string[],
+  a2: string[]
+): { same: boolean; new: string[]; missing: string[] } {
+  const s1 = new Set(a1);
+  const missed = new Set(s1);
+  const result = { same: true, new: [] as string[], missing: [] as string[] };
+  for (let i = 0, l = a2.length; i < l; i++) {
+    const value = a2[i];
+    if (!s1.has(value)) {
+      result.same = false;
+      result.new.push(value);
+    } else {
+      missed.delete(value);
+    }
+  }
+  if (missed.size > 0) {
+    result.same = false;
+    result.missing = [...missed];
+  }
+  return result;
+}
+
 function verifyExecutionPathExists(
   steps: Step[],
   key: string,
@@ -814,13 +1104,35 @@ function formatDuration(millis: number) {
   if (millis < 100000) {
     return (millis / 1000).toFixed(1) + "s";
   }
+  let hours = Math.floor(millis / 3600000);
   let minutes = Math.floor(millis / 60000);
   let seconds = ((millis - minutes * 60000) / 1000).toFixed(0);
   if (seconds === "60") {
     minutes += 1;
     seconds = "00";
   }
-  return `${minutes.toFixed(0)}m${seconds.padStart(2, "0")}s`;
+  return hours < 2
+    ? `${minutes.toFixed(0)}m${seconds.padStart(2, "0")}s`
+    : `${hours.toFixed(0)}h${(Math.floor((millis % 3600000) / 6000) / 10)
+        .toFixed(1)
+        .padStart(4, "0")}m`;
+}
+
+function parseMillis(value: number | string): number {
+  if (typeof value === "number") {
+    return value;
+  }
+  const match = value.match(/^(\d+)(h|m|s)$/);
+  if (!match) {
+    throw new TypeError(`Cannot parse time from "${value}"`);
+  }
+  const amount = Number(match[1]);
+  if (match[2] === "s") {
+    return amount * 1000;
+  } else if (match[2] === "m") {
+    return amount * 60 * 1000;
+  }
+  return amount * 60 * 60 * 1000;
 }
 
 function indexOfMin(data: number[]): number {
