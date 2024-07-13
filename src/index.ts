@@ -1,5 +1,6 @@
 import { stderr, stdout } from "node:process";
 import fs from "node:fs/promises";
+import crypto from "node:crypto";
 import { $ as build$ } from "execa";
 import fg from "fast-glob";
 import { createLogUpdate } from "log-update";
@@ -80,6 +81,7 @@ type EvalClause<Token extends string = string> = (
 ) => ClauseResult;
 
 type Clause<Token extends string> =
+  | { modified: string | string[] }
   | { expired: string | string[]; ttl: Millis }
   | { missing: string | string[] }
   | EvalClause<Token>;
@@ -395,6 +397,8 @@ export function schedule<
     },
   };
 }
+
+export { execa } from "execa";
 
 type TaskTracker = {
   title: string;
@@ -894,7 +898,7 @@ type FileClause =
       ttl: number;
     }
   | {
-      type: "missing";
+      type: "missing" | "modified";
       patterns: string[];
       key: string;
     };
@@ -916,7 +920,15 @@ function readFileClause(clause?: Clause<string>): FileClause | undefined {
     return {
       type: "missing",
       patterns,
-      key: JSON.stringify({ missing: patterns }),
+      key: JSON.stringify({ missing: [...patterns].sort() }),
+    };
+  }
+  if ("modified" in clause) {
+    const patterns = toStringArray(clause.modified);
+    return {
+      type: "modified",
+      patterns,
+      key: JSON.stringify({ modified: [...patterns].sort() }),
     };
   }
   const residue: never = clause;
@@ -925,7 +937,7 @@ function readFileClause(clause?: Clause<string>): FileClause | undefined {
 
 function toStringArray(value: unknown): string[] {
   if (Array.isArray(value)) {
-    return value.map((item) => String(item)).sort();
+    return value.map((item) => String(item));
   }
   return [String(value)];
 }
@@ -941,6 +953,59 @@ async function checkFiles(
 ): ClauseResult {
   if (!clause) {
     return { shouldRun: true };
+  }
+
+  if (clause.type === "modified") {
+    const found = (await fg.async(clause.patterns)).sort();
+
+    if (found.length === 0) {
+      recording.save(clause.key, undefined);
+      return {
+        shouldRun: true,
+        note: `(Nothing found for ${clause.patterns.join(";")})`,
+      };
+    }
+
+    const next = new Map<string, string>();
+    const prev = new Map<string, string>();
+    await Promise.all(found.map(async (f) => next.set(f, await sha1(f))));
+    const saved = await recording.load(clause.key);
+    saved?.forEach((slug) => {
+      const [file, hash] = slug.split("///");
+      prev.set(file, hash);
+    });
+    const data = [...next.entries()].map(([k, v]) => `${k}///${v}`);
+    recording.save(clause.key, data);
+
+    const list = compareContents([...prev.keys()], [...next.keys()]);
+
+    if (!list.same) {
+      if (list.new.length > 0) {
+        return {
+          shouldRun: true,
+          note: `(Found ${describeListContents(list.new)})`,
+        };
+      }
+      if (list.missing.length > 0) {
+        return {
+          shouldRun: true,
+          note: `(Missing ${describeListContents(list.missing)})`,
+        };
+      }
+    }
+
+    const modified = found.filter((f) => next.get(f) !== prev.get(f));
+    if (modified.length > 0) {
+      return {
+        shouldRun: true,
+        note: `(Modified ${describeListContents(modified)})`,
+      };
+    }
+
+    return {
+      shouldRun: false,
+      note: `(Matched ${pluralize(found.length, "file")})`,
+    };
   }
 
   if (clause.type === "expired") {
@@ -997,15 +1062,11 @@ async function checkFiles(
     recording.save(clause.key, found);
 
     if (previouslyFound) {
-      const content = compareContents(previouslyFound, found);
-      if (content.missing.length > 0) {
-        const more =
-          content.missing.length === 1
-            ? ""
-            : ` +${content.missing.length - 1} more`;
+      const list = compareContents(previouslyFound, found);
+      if (list.missing.length > 0) {
         return {
           shouldRun: true,
-          note: `(Missing ${content.missing[0]}${more})`,
+          note: `(Missing ${describeListContents(list.missing)})`,
         };
       }
     }
@@ -1041,6 +1102,28 @@ function compareContents(
     result.missing = [...missed];
   }
   return result;
+}
+
+function describeListContents(items: string[]): string {
+  if (items.length === 0) {
+    return "";
+  } else if (items.length === 1) {
+    return items[0];
+  } else {
+    return `${items[0]} +${items.length - 1} more`;
+  }
+}
+
+export async function sha1(path: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    import("node:fs").then((fs) => {
+      const hash = crypto.createHash("sha1");
+      const stream = fs.createReadStream(path);
+      stream.on("error", reject);
+      stream.on("data", (chunk) => hash.update(chunk));
+      stream.on("end", () => resolve(hash.digest("base64")));
+    });
+  });
 }
 
 function verifyExecutionPathExists(
@@ -1208,6 +1291,10 @@ function validateToken<T>(value: T): T {
     }
   }
   return value;
+}
+
+function pluralize(count: number, text1: string, textMore?: string): string {
+  return count + " " + (count === 1 ? text1 : textMore ?? text1 + "s");
 }
 
 function getTitle(fn: Function, alternative: string) {
