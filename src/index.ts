@@ -61,6 +61,7 @@ type Matcher<Token extends string> = ((
 type Actions<R = void> = {
   readonly call: ((task: (executor: Executor) => Promise<unknown>) => R) &
     ((label: string, task: (executor: Executor) => Promise<unknown>) => R);
+  readonly pass: (value?: unknown) => R;
 };
 
 type Restrictions<Token extends string> = {
@@ -105,6 +106,7 @@ type Step = {
   evalClause?: EvalClause;
   fileClause?: FileClause;
   getResult?: () => unknown;
+  passResult: unknown;
   data?: Record<string, unknown>;
 };
 
@@ -169,25 +171,34 @@ export function schedule<
         let taskClause: Clause<string> | undefined = undefined;
         let taskResult: unknown = undefined;
         const getResult = () => taskResult;
-        const actions = {
-          call: (
-            nameSource: ((executor: Executor) => unknown) | string,
+        const arrangeOperation = <T>(type: "call" | "pass", result: T) => {
+          return (
+            nameSource?: ((executor: Executor) => unknown) | string | unknown,
             fn?: (executor: Executor) => unknown
           ) => {
             const stepId = steps.length;
             const task =
-              typeof nameSource === "function"
-                ? nameSource
-                : (nonNull(nameSource, "First argument is required, found %s"),
-                  nonNull(
-                    fn,
-                    "Second argument function is required, found %s"
-                  ));
-            const title = color.bold(
-              task !== nameSource
-                ? String(nameSource)
-                : getTitle(task, "#" + (steps.length + 1))
-            );
+              type === "pass"
+                ? identity
+                : ((typeof nameSource === "function"
+                    ? nameSource
+                    : (nonNull(
+                        nameSource,
+                        "First argument is required, found %s"
+                      ),
+                      nonNull(
+                        fn,
+                        "Second argument function is required, found %s"
+                      ))) as (executor: Executor) => unknown);
+            const title =
+              type === "pass"
+                ? "pass"
+                : color.bold(
+                    task !== nameSource
+                      ? String(nameSource)
+                      : getTitle(task, "#" + (steps.length + 1))
+                  );
+            const passResult = type === "pass" ? nameSource : undefined;
             const input: string[] = [];
             const requirements: { token: string; expect: boolean }[] = [];
             if (!focusedOptions) {
@@ -243,10 +254,17 @@ export function schedule<
                 evalClause: readEvalClause(taskClause),
                 fileClause: readFileClause(taskClause),
                 getResult,
+                passResult,
                 data: focusedOptions?.data,
               });
             }
-          },
+            return result;
+          };
+        };
+
+        const actions = {
+          call: arrangeOperation("call", undefined),
+          pass: arrangeOperation("pass", undefined),
         };
 
         const skippable = {
@@ -257,10 +275,8 @@ export function schedule<
               else: (value) => (taskResult = value),
             };
             return {
-              call: (arg0, arg1?: Parameters<typeof actions.call>[1]) => {
-                actions.call(arg0, arg1);
-                return recovery;
-              },
+              call: arrangeOperation("call", recovery),
+              pass: arrangeOperation("pass", recovery),
             } satisfies Actions<Recovery>;
           },
         };
@@ -330,10 +346,12 @@ export function schedule<
             note = "note" in result ? String(result.note) : "";
           }
           if (!shouldRun && step.allowSkipping) {
-            const info =
-              color.dim(step.title) + (note ? " " + color.magenta(note) : "");
-            reporter.logger?.log("SKIPPING", info, color.gray("@00"));
-            reporter.puffer?.emit(`${reporter.symbols.skip} ${info}\n`);
+            if (step.task !== identity) {
+              const info =
+                color.dim(step.title) + (note ? " " + color.magenta(note) : "");
+              reporter.logger?.log("SKIPPING", info, color.gray("@00"));
+              reporter.puffer?.emit(`${reporter.symbols.skip} ${info}\n`);
+            }
             if (step.output) {
               group.activate(step.output, step.getResult?.());
             }
@@ -345,7 +363,13 @@ export function schedule<
         if (!shouldRun) {
           note = "(skip disabled)";
         }
-        reporter.start(group, step, note);
+        if (step.task === identity) {
+          if (step.output) {
+            group.activate(step.output, step.passResult);
+          }
+        } else {
+          reporter.start(group, step, note);
+        }
       };
 
       const group: Group = {
