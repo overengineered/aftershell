@@ -92,6 +92,9 @@ type Millis = number | `${number}s` | `${number}m` | `${number}h`;
 type Pattern<Token extends string> = Token | `?${Token}` | `!${Token}`;
 type Output<Token> = { make: Token };
 
+type StepResult = "completed" | "cancelled" | "failed" | "skipped";
+type StepState = "pending" | "preparing" | StepResult;
+
 type Step = {
   stepId: number;
   title: string;
@@ -107,6 +110,9 @@ type Step = {
   fileClause?: FileClause;
   getResult?: () => unknown;
   passResult: unknown;
+  state: StepState;
+  end: Promise<StepResult>;
+  finish: (result: StepResult) => void;
   data?: Record<string, unknown>;
 };
 
@@ -119,7 +125,7 @@ type Runtime = {
 
 type Group = {
   data: Record<string, unknown>;
-  activate: (output: Output<string>, result: unknown) => void;
+  activate: (output: Output<string>, result: unknown) => Promise<unknown>;
   runtime: Runtime;
 };
 
@@ -239,7 +245,11 @@ export function schedule<
               execution === "full" ||
               (execution === "focused" && focusedOptions)
             ) {
-              steps.push({
+              let finish = undefined as unknown as Step["finish"];
+              const end = new Promise<StepResult>((res) => {
+                finish = (value) => ((step.state = value), res(value));
+              });
+              const step: Step = {
                 stepId,
                 title,
                 isQualified,
@@ -256,7 +266,11 @@ export function schedule<
                 getResult,
                 passResult,
                 data: focusedOptions?.data,
-              });
+                state: "pending",
+                end,
+                finish,
+              };
+              steps.push(step);
             }
             return result;
           };
@@ -317,7 +331,7 @@ export function schedule<
       const ready = runnable.filter(isReady);
       ready.forEach((step) => remaining.delete(step));
 
-      const reporter = new TaskReporter(runtime, verbose);
+      const reporter = new TaskReporter(runtime, verbose, runnable);
       const history = new History(".aftershell", reporter.logger);
 
       if (verbose && runnable.length < steps.length) {
@@ -333,6 +347,7 @@ export function schedule<
         let shouldRun = false;
         let note: string | undefined = undefined;
         if (step.evalClause || step.fileClause) {
+          step.state = "preparing";
           const result: unknown =
             (await step.evalClause?.(step.data)) ??
             (await checkFiles(step.fileClause, history));
@@ -347,13 +362,16 @@ export function schedule<
           }
           if (!shouldRun && step.allowSkipping) {
             if (step.task !== identity) {
-              const info =
-                color.dim(step.title) + (note ? " " + color.magenta(note) : "");
+              const title = reporter.puffer
+                ? color.strikethrough(color.dim(step.title))
+                : color.dim(step.title);
+              const info = title + (note ? " " + color.magenta(note) : "");
               reporter.logger?.log("SKIPPING", info, color.gray("@00"));
               reporter.puffer?.emit(`${reporter.symbols.skip} ${info}\n`);
             }
+            step.finish("skipped");
             if (step.output) {
-              group.activate(step.output, step.getResult?.());
+              await group.activate(step.output, step.getResult?.());
             }
             return;
           }
@@ -364,8 +382,9 @@ export function schedule<
           note = "(skip disabled)";
         }
         if (step.task === identity) {
+          step.finish("skipped");
           if (step.output) {
-            group.activate(step.output, step.passResult);
+            await group.activate(step.output, step.passResult);
           }
         } else {
           reporter.start(group, step, note);
@@ -388,7 +407,7 @@ export function schedule<
               }
             }
           }
-          ready.forEach(activateStep(this));
+          return Promise.all(ready.map(activateStep(this)));
         },
       };
 
@@ -399,6 +418,7 @@ export function schedule<
           if (runtime.isInteractive && reporter.logger) {
             reporter.logger.shouldAddNewLine = true;
           }
+          remaining.forEach((it) => it.finish("skipped"));
         } else if (
           runtime.status === "failed" ||
           runtime.status === "cancelled"
@@ -459,16 +479,17 @@ class TaskReporter {
   logger: Logger | undefined;
   timer: NodeJS.Timeout | undefined;
   puffer: ReturnType<typeof startPuffer> | undefined;
-  // @ts-ignore
-  resolve: () => void;
-  // @ts-ignore
-  reject: (e: unknown) => void;
-  outcome = new Promise<void>(
-    (res, rej) => ((this.resolve = res), (this.reject = rej))
-  );
+  outcome: Promise<void>;
+  all: Step[];
+  reportable: Step[];
+  goal: string;
 
-  constructor(runtime: Runtime, verbose: boolean) {
+  constructor(runtime: Runtime, verbose: boolean, all: Step[]) {
     this.runtime = runtime;
+    this.all = all;
+    this.reportable = all.filter((it) => it.task !== identity);
+    this.goal = String(this.reportable.length);
+    this.outcome = Promise.all([...all.map((it) => it.end)]).then(this.close);
     if (verbose) {
       this.logger = new Logger();
     } else {
@@ -583,8 +604,9 @@ class TaskReporter {
         const duration = styled(formatDuration(Date.now() - stepStart));
         this.logger?.log("FINISHED", `${step.title} ${duration}`, wid);
         this.puffer?.emit(`${this.symbols.done} ${step.title} ${duration}\n`);
+        step.finish("completed");
         if (step.output && this.runtime.status === "active") {
-          group.activate(step.output, result);
+          return group.activate(step.output, result);
         }
       })
       .catch((error) => {
@@ -594,44 +616,55 @@ class TaskReporter {
         if (wasCancelled) {
           this.puffer?.emit(`${this.symbols.stop} ${step.title}\n`);
           this.logger?.log("CANCELLED", step.title, wid);
+          step.finish("cancelled");
         } else {
           this.puffer?.emit(`${this.symbols.fail} ${color.red(step.title)}\n`);
           this.logger?.log("FAILED", color.red(step.title) + "\n" + error, wid);
+          step.finish("failed");
         }
         if (!this.runtime.exitCause) {
           this.runtime.exitCause = { error };
           this.runtime.status = "failed";
+          this.all.forEach((it) => {
+            if (!isFinished(it)) {
+              it.finish("cancelled");
+            }
+          });
         }
       })
       .finally(() => {
         const pos = this.running.indexOf(tracker);
         this.running.splice(pos, 1);
-        if (this.running.length === 0) {
-          this.puffer?.stop();
-          clearInterval(this.timer);
-          this.timer = undefined;
-          const duration = formatDuration(Date.now() - this.runtime.start);
-          switch (group.runtime.status) {
-            case "active":
-              this.logger?.log("COMPLETED", `Done in ${duration}`);
-              this.resolve();
-              break;
-            case "failed":
-              const failure = group.runtime.exitCause;
-              const error =
-                failure && "error" in failure ? failure.error : undefined;
-              this.reject(error);
-              break;
-            case "cancelled":
-              const info = group.runtime.exitCause?.interrupt
-                ? ` by ${group.runtime.exitCause?.interrupt}`
-                : "";
-              this.logger?.log("COMPLETED", color.red(`Cancelled${info}`));
-              break;
-          }
-        }
       });
   }
+
+  close = () => {
+    const failure = this.runtime.exitCause;
+    const error = failure && "error" in failure ? failure.error : undefined;
+    if (error) {
+      throw error;
+    }
+    if (this.puffer) {
+      clearInterval(this.timer);
+      this.timer = undefined;
+      this.puffer.stop();
+    }
+    const duration = formatDuration(Date.now() - this.runtime.start);
+    switch (this.runtime.status) {
+      case "active":
+        const msg = `${describeAchievements(this.reportable)} in ${duration}`;
+        this.logger?.log("COMPLETED", msg);
+        break;
+      case "failed":
+        break;
+      case "cancelled":
+        const info = this.runtime.exitCause?.interrupt
+          ? ` by ${this.runtime.exitCause?.interrupt}`
+          : "";
+        this.logger?.log("COMPLETED", color.red(`Cancelled${info}`));
+        break;
+    }
+  };
 
   result() {
     return this.outcome;
@@ -643,7 +676,7 @@ class TaskReporter {
     const l = this.frames.length;
     const x = (this.active = this.active + 1);
     const dot = this.runtime.status === "active" ? color.cyanBright : color.red;
-    let info = this.running
+    let info = (this.timer === undefined ? [] : this.running)
       .map((tracker, i) => {
         const frame = dot(this.frames[(x + ((l - i) % l)) % l]);
         const tag = tracker.titleTag ? " " + tracker.titleTag : "";
@@ -669,7 +702,7 @@ class TaskReporter {
       this.runtime.status === "failed" ||
       this.runtime.status === "cancelled"
     ) {
-      if (this.running.length > 0) {
+      if (this.timer !== undefined) {
         const status =
           this.runtime.status === "cancelled" ? "Cancelled" : "Failed";
         const leftovers =
@@ -681,8 +714,18 @@ class TaskReporter {
         }
       }
     } else {
-      info += //
-        color.dim(`\nTime: ${formatDuration(Date.now() - this.runtime.start)}`);
+      const timing = formatDuration(Date.now() - this.runtime.start);
+      if (this.timer !== undefined) {
+        const done = String(this.reportable.filter(isFinished).length);
+        info +=
+          `\n[${done.padStart(this.goal.length)}/${this.goal}] ` +
+          color.dim(`Time: ${timing}`);
+      } else {
+        info +=
+          `\n${color.dim(`[${getFormattedTimestamp()}]`)} ` +
+          describeAchievements(this.reportable) +
+          ` in ${timing}`;
+      }
     }
     return info;
   };
@@ -1028,7 +1071,10 @@ async function checkFiles(
 
     return {
       shouldRun: false,
-      note: `(Matched ${pluralize(found.length, "file")})`,
+      note:
+        found.length === 1
+          ? `(No changes in ${found[0]})`
+          : `(No changes in ${found.length} files)`,
     };
   }
 
@@ -1130,12 +1176,51 @@ function compareContents(
 
 function describeListContents(items: string[]): string {
   if (items.length === 0) {
-    return "";
+    return "⓪";
   } else if (items.length === 1) {
     return items[0];
   } else {
     return `${items[0]} +${items.length - 1} more`;
   }
+}
+
+function describeAchievements(steps: Step[]) {
+  let completed = 0;
+  let skipped = 0;
+  let failed = 0;
+  let cancelled = 0;
+  for (const step of steps) {
+    step.state === "completed" && (completed += 1);
+    step.state === "skipped" && (skipped += 1);
+    step.state === "failed" && (failed += 1);
+    step.state === "cancelled" && (cancelled += 1);
+  }
+  let info = "";
+  if (completed > 0) {
+    info = `Completed ${pluralize(completed, "task")}`;
+  }
+  if (skipped > 0) {
+    if (info.length > 0) {
+      info += `, skipped ${skipped}`;
+    } else {
+      info = `Skipped ${pluralize(skipped, "task")}`;
+    }
+  }
+  if (failed > 0) {
+    if (info.length > 0) {
+      info += `, failed ${failed}`;
+    } else {
+      info = `Failed ${pluralize(failed, "task")}`;
+    }
+  }
+  if (cancelled > 0) {
+    if (info.length > 0) {
+      info += `, cancelled ${cancelled}`;
+    } else {
+      info = `Cancelled ${pluralize(failed, "task")}`;
+    }
+  }
+  return info || "Done";
 }
 
 export async function sha1(path: string): Promise<string> {
@@ -1174,6 +1259,10 @@ function verifyExecutionPathExists(
       verifyExecutionPathExists(steps, target, optionPath, done, isRoot);
     }
   }
+}
+
+function isFinished(step: Step): boolean {
+  return step.state !== "pending" && step.state !== "preparing";
 }
 
 function identity<T>(x: T): T {
