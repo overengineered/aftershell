@@ -4,8 +4,6 @@ import crypto from "node:crypto";
 import { $ as build$ } from "execa";
 import fg from "fast-glob";
 import { createLogUpdate } from "log-update";
-import stripAnsi from "strip-ansi";
-import * as ansiColors from "yoctocolors";
 
 type SimpleItem = string | number;
 
@@ -129,12 +127,7 @@ type Group = {
   runtime: Runtime;
 };
 
-const colorLess = Object.fromEntries(
-  Object.keys(ansiColors).map((k) => [k, identity])
-) as typeof ansiColors;
-
 const allowsInput = typeof process.stdin.setRawMode === "function";
-const color = allowsInput ? ansiColors : colorLess;
 
 const exec$ = withGlob(build$);
 
@@ -199,7 +192,8 @@ export function schedule<
             const title =
               type === "pass"
                 ? "pass"
-                : color.bold(
+                : decorate(
+                    [ANSI.Bold],
                     task !== nameSource
                       ? String(nameSource)
                       : getTitle(task, "#" + (steps.length + 1))
@@ -337,8 +331,9 @@ export function schedule<
       if (verbose && runnable.length < steps.length) {
         for (const skipped of steps) {
           if (!runnable.includes(skipped)) {
-            const info = color.dim(skipped.title);
-            reporter.logger?.log("SKIPPING", info, color.gray("@00"));
+            const info = decorate([ANSI.Dim], skipped.title);
+            const tag = decorate([ANSI.Gray], "@00");
+            reporter.logger?.log("SKIPPING", info, tag);
           }
         }
       }
@@ -363,10 +358,12 @@ export function schedule<
           if (!shouldRun && step.allowSkipping) {
             if (step.task !== identity) {
               const title = reporter.puffer
-                ? color.strikethrough(color.dim(step.title))
-                : color.dim(step.title);
-              const info = title + (note ? " " + color.magenta(note) : "");
-              reporter.logger?.log("SKIPPING", info, color.gray("@00"));
+                ? decorate([ANSI.Dim, ANSI.StrikeThrough], step.title)
+                : decorate([ANSI.Dim], step.title);
+              const info =
+                title + (note ? " " + decorate([ANSI.Magenta], note) : "");
+              const tag = decorate([ANSI.Gray], "@00");
+              reporter.logger?.log("SKIPPING", info, tag);
               reporter.puffer?.emit(`${reporter.symbols.skip} ${info}\n`);
             }
             step.finish("skipped");
@@ -505,14 +502,14 @@ class TaskReporter {
   }
 
   symbols = {
-    done: color.green("✔"),
-    fail: color.red("✖"),
-    stop: color.red("◼"),
-    skip: color.yellow("∅"),
+    done: decorate([ANSI.Green], "✔"),
+    fail: decorate([ANSI.Red], "✖"),
+    stop: decorate([ANSI.Red], "◼"),
+    skip: decorate([ANSI.Yellow], "∅"),
   };
 
   start(group: Group, step: Step, note?: string) {
-    const wid = color.cyan(this.issueId());
+    const wid = decorate([ANSI.Cyan], this.issueId());
     const tracker: TaskTracker = {
       step,
       title: step.title,
@@ -574,12 +571,12 @@ class TaskReporter {
     const worker: Worker = {
       data: group.data,
       displayTitle: (title: string) =>
-        void (tracker.title = color.bold(stripAnsi(title))),
+        void (tracker.title = decorate([ANSI.Bold], title)),
       displayTitleTag: (tag: string) =>
-        void (tracker.titleTag = stripAnsi(tag)),
+        void (tracker.titleTag = decorate([], tag)),
       addActivity: (title: string) => {
         const activity: Activity = {
-          title: stripAnsi(title),
+          title: decorate([], title),
           status: "active",
         };
         this.logger?.log("INIT", activity.title, wid);
@@ -596,12 +593,17 @@ class TaskReporter {
       $: executor as unknown as Executor,
     };
     this.running.push(tracker);
-    const start = note ? `${step.title} ${color.magenta(note)}` : step.title;
+    const start = note
+      ? `${step.title} ${decorate([ANSI.Magenta], note)}`
+      : step.title;
     this.logger?.log("STARTING", start, wid);
     Promise.resolve(step.task.call(worker, executor as unknown as Executor))
       .then((result) => {
-        const styled = this.logger ? color.green : color.dim;
-        const duration = styled(formatDuration(Date.now() - stepStart));
+        const style = this.logger ? ANSI.Green : ANSI.Dim;
+        const duration = decorate(
+          [style],
+          formatDuration(Date.now() - stepStart)
+        );
         this.logger?.log("FINISHED", `${step.title} ${duration}`, wid);
         this.puffer?.emit(`${this.symbols.done} ${step.title} ${duration}\n`);
         step.finish("completed");
@@ -618,8 +620,9 @@ class TaskReporter {
           this.logger?.log("CANCELLED", step.title, wid);
           step.finish("cancelled");
         } else {
-          this.puffer?.emit(`${this.symbols.fail} ${color.red(step.title)}\n`);
-          this.logger?.log("FAILED", color.red(step.title) + "\n" + error, wid);
+          const coloredTitle = decorate([ANSI.Red], step.title);
+          this.puffer?.emit(`${this.symbols.fail} ${coloredTitle}\n`);
+          this.logger?.log("FAILED", coloredTitle + "\n" + error, wid);
           step.finish("failed");
         }
         if (!this.runtime.exitCause) {
@@ -659,9 +662,9 @@ class TaskReporter {
         break;
       case "cancelled":
         const info = this.runtime.exitCause?.interrupt
-          ? ` by ${this.runtime.exitCause?.interrupt}`
-          : "";
-        this.logger?.log("COMPLETED", color.red(`Cancelled${info}`));
+          ? `Cancelled by ${this.runtime.exitCause?.interrupt}`
+          : "Cancelled";
+        this.logger?.log("COMPLETED", decorate([ANSI.Red], info));
         break;
     }
   };
@@ -675,24 +678,25 @@ class TaskReporter {
   renderTaskList = () => {
     const l = this.frames.length;
     const x = (this.active = this.active + 1);
-    const dot = this.runtime.status === "active" ? color.cyanBright : color.red;
+    const dot = this.runtime.status === "active" ? ANSI.CyanBright : ANSI.Red;
     let info = (this.timer === undefined ? [] : this.running)
       .map((tracker, i) => {
-        const frame = dot(this.frames[(x + ((l - i) % l)) % l]);
+        const frame = decorate([dot], this.frames[(x + ((l - i) % l)) % l]);
         const tag = tracker.titleTag ? " " + tracker.titleTag : "";
         let line = `${frame} ${tracker.title}${tag}\n`;
         tracker.activities.forEach((activity, index, all) => {
-          const connector = color.gray(index === all.length - 1 ? "└╸" : "├╸");
+          const bar = index === all.length - 1 ? "└╸" : "├╸";
+          const connector = decorate([ANSI.Gray], bar);
           const status =
             activity.status === "done"
               ? this.symbols.done
               : activity.status === "fail"
               ? this.symbols.fail
               : activity.status === "command"
-              ? color.bold(color.cyanBright("$"))
-              : color.bold(color.cyanBright("▸"));
+              ? decorate([ANSI.Bold, ANSI.CyanBright], "$")
+              : decorate([ANSI.Bold, ANSI.CyanBright], "▸");
           const short = activity.title.slice(0, (stdout.columns ?? 80) - 8);
-          line += `  ${color.dim(connector)}${status} ${short}\n`;
+          line += `  ${decorate([ANSI.Dim], connector)}${status} ${short}\n`;
         });
         return line;
       })
@@ -719,10 +723,10 @@ class TaskReporter {
         const done = String(this.reportable.filter(isFinished).length);
         info +=
           `\n[${done.padStart(this.goal.length)}/${this.goal}] ` +
-          color.dim(`Time: ${timing}`);
+          decorate([ANSI.Dim], `Time: ${timing}`);
       } else {
         info +=
-          `\n${color.dim(`[${getFormattedTimestamp()}]`)} ` +
+          `\n${decorate([ANSI.Dim], `[${getFormattedTimestamp()}]`)} ` +
           describeAchievements(this.reportable) +
           ` in ${timing}`;
       }
@@ -776,26 +780,40 @@ class Logger {
     FAIL: "→",
   };
   log(action: LoggerAction, message: string, stepMarker = "") {
-    const ts = getFormattedTimestamp();
-    const paint = this.tagColors[action] ?? identity;
-    const print = this.messageColors[action] ?? identity;
-    const symbol = this.symbols[action] ?? "~";
-    const gutter =
-      action === "OUTPUT" ? this.getColor(stepMarker)(symbol) : symbol;
-    const id = stepMarker || symbol ? ` ${stepMarker}${gutter}` : "";
-    const correction = this.shouldAddNewLine ? "\n" : "";
+    // const ts = getFormattedTimestamp();
+    // const paint = this.tagColors[action] ?? identity;
+    // const print = this.messageColors[action] ?? identity;
+    // const symbol = this.symbols[action] ?? "~";
+    // const gutter =
+    //   action === "OUTPUT" ? this.getColor(stepMarker)(symbol) : symbol;
+    // const id = stepMarker || symbol ? ` ${stepMarker}${gutter}` : "";
+    // const correction = this.shouldAddNewLine ? "\n" : "";
+    // this.shouldAddNewLine = false;
+    // const prefix = `${correction}${color.dim(`[${ts}]`)}${id}`;
+    // const annotation =
+    //   action === "OUTPUT" || action === "COMMAND" || action === "COMPLETED"
+    //     ? ""
+    //     : paint(`[${action}] `);
+    // this.stream.write(`${prefix} ${annotation}${print(message)}\n`);
+    const line = assemble(
+      [null, this.shouldAddNewLine ? "\n" : ""],
+      [ANSI.Dim, getFormattedTimestamp()],
+      [null, " "],
+      [this.getColor(stepMarker, action), this.symbols[action] ?? "~"],
+      [null, " "],
+      [this.tagColors[action] ?? null, action],
+      [this.messageColors[action] ?? null, message]
+    );
+    this.stream.write(line + "\n");
     this.shouldAddNewLine = false;
-    const prefix = `${correction}${color.dim(`[${ts}]`)}${id}`;
-    const annotation =
-      action === "OUTPUT" || action === "COMMAND" || action === "COMPLETED"
-        ? ""
-        : paint(`[${action}] `);
-    this.stream.write(`${prefix} ${annotation}${print(message)}\n`);
   }
   end(stepMarker: string) {
     this.gutterUsage.delete(stepMarker);
   }
-  getColor(id: string): typeof color.red {
+  getColor(id: string, action: string): string {
+    if (action !== "OUTPUT") {
+      return null;
+    }
     const preselected = this.gutterUsage.get(id);
     if (preselected !== undefined) {
       return this.gutterColors[preselected];
@@ -820,9 +838,7 @@ class Logger {
 }
 
 function sanitizeText(text: string): string {
-  // TODO: leave colors when stripping ansi, reveal other ansi codes as plain text
-  // https://github.com/netzkolchose/node-ansiparser
-  return stripAnsi(text);
+  return decorate([], text);
 }
 
 function startPuffer(getState: () => string) {
@@ -1342,6 +1358,204 @@ function indexOfMin(data: number[]): number {
   }
   return minIndex;
 }
+
+export function decorate(
+  theme: string[],
+  text: string,
+  { maxLength }: { maxLength?: number } = {}
+) {
+  const brush: Brush = {};
+  prepareBrush(brush, theme);
+  let output = `\x1b[${Object.values(brush).join(";")}m`;
+  let visibleLength = 0;
+  let acceptsCombining = true;
+  const append = (segment: string, length?: number) => {
+    const segmentLength = length ?? segment.length;
+    const receivedCombining = length === 0 && segment.length === 1;
+    acceptsCombining =
+      acceptsCombining &&
+      (maxLength == null || visibleLength < maxLength || receivedCombining);
+    const appendix =
+      maxLength == null ||
+      (visibleLength + segmentLength <= maxLength &&
+        (visibleLength < maxLength || (receivedCombining && acceptsCombining)))
+        ? segment
+        : segment.slice(0, maxLength - visibleLength);
+    output += appendix;
+    visibleLength += appendix === segment ? segmentLength : appendix.length;
+  };
+  let themeConfig = null;
+  for (const c of text) {
+    if (themeConfig !== null) {
+      if (fitsIntoThemeConfig(themeConfig, c)) {
+        if (c === "m") {
+          const settings = themeConfig.slice(1).split(";");
+          if (prepareBrush(brush, settings)) {
+            append(`\x1b${themeConfig}m`, 0);
+            themeConfig = null;
+            continue;
+          }
+        } else {
+          themeConfig += c;
+          continue;
+        }
+      }
+      append(`\\x1b${themeConfig}`);
+      themeConfig = null;
+    }
+    const cp = Number(c.codePointAt(0));
+    if (cp === 0x1b) {
+      themeConfig = "";
+    } else if (cp < 32) {
+      append("\\x" + cp.toString(16).padStart(2, "0"));
+    } else {
+      const isCombining = // These are not all, but probably good enough
+        (cp >= 0x0300 && cp <= 0x036f) ||
+        (cp >= 0x1ab0 && cp <= 0x1aff) ||
+        (cp >= 0x1dc0 && cp <= 0x1dff) ||
+        (cp >= 0x20d0 && cp <= 0x20ff);
+      append(c, isCombining ? 0 : 1);
+    }
+  }
+
+  return output + cleanBrush(brush);
+}
+
+type Brush = Record<string, string | undefined>;
+
+function prepareBrush(brush: Brush, config: string[]) {
+  const next: Brush = {};
+  for (const value of config) {
+    if (value === "0") {
+      for (const key of Object.keys(brush)) {
+        next[key] = "0";
+      }
+      continue;
+    }
+    const attribute = Attributes[value];
+    if (attribute == null) {
+      return false;
+    }
+    for (const key of attribute) {
+      if (key in next) {
+        return false;
+      }
+      next[key] = value;
+    }
+  }
+  Object.assign(brush, next);
+  return true;
+}
+
+function cleanBrush(brush: Brush) {
+  const items: string[] = [];
+  const clean = (b: string, v: string | undefined, a: string, e: string) => {
+    if (v !== "0" && b === a && v !== e && (e !== "22" || !items.includes(e))) {
+      items.push(e);
+    }
+  };
+  for (const [a, v] of Object.entries(brush)) {
+    clean(a, v, "b", "22");
+    clean(a, v, "f", "22");
+    clean(a, v, "i", "23");
+    clean(a, v, "u", "24");
+    clean(a, v, "s", "29");
+    clean(a, v, "c", "39");
+    clean(a, v, "g", "49");
+    clean(a, v, "o", "55");
+  }
+  return items.length === 0 ? "" : `\x1b[${items.join(";")}m`;
+}
+
+function fitsIntoThemeConfig(themeConfig: string, char: string) {
+  if (themeConfig.length === 0) {
+    return char === "[";
+  } else {
+    const last = themeConfig.at(-1);
+    if (last === "[" || last === ";") {
+      return Boolean(char.match(/\d/));
+    } else {
+      return char === ";" || char === "m" || Boolean(char.match(/\d/));
+    }
+  }
+}
+
+const ANSI = {
+  Bold: "1",
+  Dim: "2",
+  Italic: "3",
+  Underline: "4",
+  StrikeThrough: "9",
+  Overline: "53",
+  Black: "30",
+  Red: "31",
+  Green: "32",
+  Yellow: "33",
+  Blue: "34",
+  Magenta: "35",
+  Cyan: "36",
+  BgRed: "41",
+  BgGreen: "42",
+  BgYellow: "43",
+  BgBlue: "44",
+  BgMagenta: "45",
+  BgCyan: "46",
+  Gray: "90",
+  RedBright: "91",
+  GreenBright: "92",
+  YellowBright: "93",
+  BlueBright: "94",
+  MagentaBright: "95",
+  CyanBright: "96",
+};
+
+const Attributes: Record<string, string> = {
+  1: "b",
+  2: "f",
+  3: "i",
+  4: "u",
+  9: "s",
+  22: "bf",
+  23: "i",
+  24: "u",
+  29: "s",
+  30: "c",
+  31: "c",
+  32: "c",
+  33: "c",
+  34: "c",
+  35: "c",
+  36: "c",
+  37: "c",
+  39: "c",
+  40: "g",
+  41: "g",
+  42: "g",
+  43: "g",
+  44: "g",
+  45: "g",
+  46: "g",
+  47: "g",
+  49: "g",
+  53: "o",
+  55: "o",
+  90: "c",
+  91: "c",
+  92: "c",
+  93: "c",
+  94: "c",
+  95: "c",
+  96: "c",
+  97: "c",
+  100: "g",
+  101: "g",
+  102: "g",
+  103: "g",
+  104: "g",
+  105: "g",
+  106: "g",
+  107: "g",
+};
 
 function parsePosition(encoded: string) {
   for (let c = 0, x = "", y = "", o = ""; c < encoded.length; c++) {
